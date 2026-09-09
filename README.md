@@ -82,12 +82,20 @@ discovery-history log records every run/search that surfaced it.
 - `data/master/discovery_history.csv` — one row per run/search that
   discovered a business (`master_id`, `run_id`, `search_id`,
   `search_keyword`, `search_location`, `source`, `first_discovered_at`).
+- `data/master/identity_conflicts.csv` — one row per detected identity
+  collision (see below), for human review; normally empty.
 
-`master_id` is a deterministic hash of the business's most reliable
-identifier (normalized website domain, else normalized phone, else
-normalized name+address) — no fuzzy or AI matching — so it stays stable
-across runs, keywords, and cities. See the skill doc's "Persistent master
-prospect store" section for the full merge/conflict rules.
+Every incoming lead is resolved against a deterministic identity index
+(`identity key -> master_id`) rebuilt from the existing master store —
+normalized website domain, else normalized phone, else normalized
+name+address, no fuzzy or AI matching — so a business keeps the same
+`master_id` across runs, keywords, and cities even when its website or
+phone is missing from a later scrape. Genuinely conflicting identifiers
+(e.g. a lead whose website matches one master but whose phone matches a
+different master) are never silently merged; they're resolved
+deterministically and logged to `identity_conflicts.csv`. See the skill
+doc's "Persistent master prospect store" section for the full
+resolution/merge/conflict rules.
 
 Run it manually with:
 ```

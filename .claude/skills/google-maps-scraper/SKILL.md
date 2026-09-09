@@ -218,14 +218,52 @@ see below):
   triple: `master_id, run_id, search_id, search_keyword, search_location,
   source, first_discovered_at`. This is where you look up every run/search
   that surfaced a given business; the master record itself stays compact.
+- `identity_conflicts.csv` — one row per detected identity collision (see
+  below): `master_id, resolved_via_key, conflicting_master_ids,
+  business_name, run_id, search_id, detected_at`. Empty in the normal case;
+  non-empty rows need a human look, since they are never auto-merged.
 
-**How `master_id` is generated (deterministic, no fuzzy/AI matching):**
-reuses `normalize.dedup_key()`'s existing priority order — normalized
-website domain, else normalized phone, else normalized business name +
-address — and hashes it: `sha256(":".join(key)).hexdigest()[:16]`. Because
-the key never includes `run_id`/`search_id`/`scraped_at`, the same business
-gets the same `master_id` no matter which run, keyword, city, or date
-surfaced it.
+**How `master_id` is assigned and kept stable (deterministic, no
+fuzzy/AI matching):** `master_id` is assigned once per business and never
+recomputed from an incoming lead's own fields alone. Every incoming lead is
+resolved against a **deterministic identity index** (`identity key ->
+master_id`) rebuilt from the existing master store, using the same
+identifiers as `normalize.dedup_key()`/`normalize.match_keys()`, in
+priority order: normalized website domain > normalized phone > normalized
+business name + address.
+
+- If a key the lead carries already resolves to an existing master, the
+  lead attaches to that master — even if the *other* fields that could
+  have identified it are blank on this run. This is what keeps a business's
+  `master_id` stable when its website or phone disappears from a later
+  Google Maps scrape (previously this recomputed the id from whichever
+  fields were present on that run alone, which changed the id and created
+  a duplicate record).
+- If none of the lead's keys match anything in the index, it's a brand-new
+  business: its `master_id` is minted via
+  `sha256(":".join(dedup_key(lead))).hexdigest()[:16]`, using the same
+  priority order (domain > phone > name+address) so a business with no
+  website/phone still gets a stable id from name+address.
+- If a later scrape reveals a website or phone for a business that was
+  first seen with only a name+address key, that new key is added to the
+  index under the *existing* master_id (matched via name+address) rather
+  than minting a new record.
+- A present, higher-priority key (domain, or phone when domain is absent)
+  that is brand-new to the index is trusted on its own: a lower-priority
+  key incidentally matching a different, unrelated master (e.g. a shared
+  phone number) does not attach this lead to that master. name+address is
+  always checked as a last-resort corroboration.
+- If a lead's own keys point at two *different* existing masters (e.g. its
+  website matches master A but its phone matches master B), this is an
+  identity conflict: it is never silently merged. Resolution picks the
+  higher-priority key's master deterministically and the collision is
+  logged to `identity_conflicts.csv` for a human to review.
+
+Because resolution is always against the persisted store, not against
+`run_id`/`search_id`/`scraped_at` or the shape of a single incoming
+record, the same business gets the same `master_id` no matter which run,
+keyword, city, or date surfaced it, and no matter which of its identifying
+fields happened to be populated on that particular scrape.
 
 **Cross-run merge rule when a business reappears:**
 - Blank-fill only: a populated existing field is never overwritten by an
@@ -256,7 +294,11 @@ count do not grow.
 `data/master/` via `actions/cache` between runs (so the store accumulates
 run-over-run without committing anything), and always uploads
 `google-maps-master-store-<run_id>` (`master.csv`, `master.json`,
-`discovery_history.csv`) as a workflow artifact.
+`discovery_history.csv`) as a workflow artifact. `update_master.py` also
+writes `data/master/identity_conflicts.csv`, but the workflow's artifact
+upload step is unchanged as part of this fix, so check that file locally
+(or extend the upload step separately) if you need to review conflicts
+from a CI run.
 
 **Why lead data is never committed:** `data/master/*` is gitignored (only
 `data/master/.gitkeep` is tracked), matching `data/google-maps/`. The

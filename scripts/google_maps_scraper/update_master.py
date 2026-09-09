@@ -11,14 +11,44 @@ No AI/fuzzy matching. Pure, rule-based Python, same spirit as normalize.py.
 
 master_id algorithm
 --------------------
-Reuses normalize.dedup_key()'s priority order (domain > phone >
-name+address) so identity is consistent with in-run dedup, then hashes it:
+master_id is assigned ONCE per business and retained forever -- it is never
+recomputed from an incoming lead's own fields alone. Instead every incoming
+lead is resolved against a deterministic identity index built from the
+EXISTING master store:
 
-    master_id = sha256(":".join(dedup_key(lead))).hexdigest()[:16]
+    identity index: identity key -> master_id
+    (one master record can own several keys, e.g. its domain, its phone,
+    and its name+address key, all pointing at the same master_id)
 
-This makes master_id depend only on stable business identifiers, never on
-run_id/search_id/scraped_at, so the same business reappearing in a later
-run/search/city produces the same master_id.
+Resolution for an incoming lead:
+    1. Compute normalize.match_keys(lead) -- all reliable identifiers the
+       lead currently carries, in priority order: domain > phone >
+       name+address.
+    2. Look up each key in the identity index.
+       - No key matches anything -> brand-new business. Its master_id is
+         assigned once via compute_master_id(), which reuses
+         normalize.dedup_key()'s priority order (domain > phone >
+         name+address) so a first-seen record with no website/phone still
+         gets a stable id.
+       - All matching keys point to the same existing master_id -> the lead
+         resolves to that master_id (this is how a business keeps its
+         master_id even after its website or phone disappears from a later
+         scrape: it still matches on whichever other key survived).
+       - Matching keys point to DIFFERENT existing master_ids -> identity
+         conflict (see below). Resolved deterministically via the same
+         domain > phone > name+address priority, and recorded in
+         data/master/identity_conflicts.csv rather than silently merged.
+    3. Every key the lead carries (including any newly-discovered
+       website/phone) is added to the identity index under the resolved
+       master_id, so a later scrape that reveals a website or phone for an
+       existing name+address-only business attaches to that same record
+       instead of minting a new one.
+
+This makes master_id depend only on stable business identifiers matched
+against the existing master store, never on run_id/search_id/scraped_at or
+on which fields happen to be populated in a single incoming lead, so the
+same business reappearing in a later run/search/city -- even with fewer
+identifying fields than before -- produces the same master_id.
 
 Conflict rule for merging fields on an existing master record
 ---------------------------------------------------------------
@@ -52,7 +82,15 @@ from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from normalize import CANONICAL_FIELDS, dedup_key  # noqa: E402
+from normalize import (  # noqa: E402
+    CANONICAL_FIELDS,
+    dedup_key,
+    domain_key,
+    match_keys,
+    normalize_address_key,
+    normalize_name_key,
+    normalize_phone_key,
+)
 
 MASTER_FIELDS = CANONICAL_FIELDS + [
     "master_id",
@@ -82,6 +120,97 @@ def compute_master_id(lead: dict) -> str:
     key = dedup_key(lead)
     digest = hashlib.sha256(":".join(str(part) for part in key).encode("utf-8")).hexdigest()
     return digest[:16]
+
+
+CONFLICT_FIELDS = [
+    "master_id",
+    "resolved_via_key",
+    "conflicting_master_ids",
+    "business_name",
+    "run_id",
+    "search_id",
+    "detected_at",
+]
+
+
+def build_identity_index(master: dict[str, dict]) -> dict[tuple, str]:
+    """Deterministic identity key -> master_id index, rebuilt from the
+    existing master store (a master record may own several keys)."""
+    index: dict[tuple, str] = {}
+    for master_id, record in master.items():
+        for key in match_keys(record):
+            index[key] = master_id
+    return index
+
+
+def resolve_master_id(lead: dict, index: dict[tuple, str]) -> tuple[str | None, dict | None]:
+    """Resolve an incoming lead against the existing identity index.
+
+    Priority: domain > phone > name+address, matching normalize.dedup_key()
+    and normalize.match_keys(). Returns (master_id_or_None, conflict_or_None).
+
+    master_id is None only when none of the lead's present keys match
+    anything in the index (brand-new business).
+
+    A present-but-STRONGER key (domain, or phone when domain is absent)
+    that does NOT match anything in the index is trusted on its own: a
+    lower-priority key incidentally matching a different existing master
+    (e.g. a coincidentally shared phone number) is NOT used to attach this
+    lead to that unrelated master. name+address is always checked as a
+    last-resort corroboration, so a business first seen with only a
+    name+address key still gets recognized once a website or phone is
+    later discovered for it.
+
+    A conflict is reported -- never used to silently merge records -- when
+    a present higher-priority key DOES match one master while a present
+    lower-priority key matches a DIFFERENT master. Resolution still picks
+    the higher-priority key's master deterministically.
+    """
+    domain = domain_key(lead.get("website", ""))
+    phone = normalize_phone_key(lead.get("phone", ""))
+    name_key = normalize_name_key(lead.get("business_name", ""))
+    address_key = normalize_address_key(lead.get("address", ""))
+
+    domain_key_tuple = ("domain", domain) if domain else None
+    phone_key_tuple = ("phone", phone) if phone else None
+    name_address_key_tuple = ("name_address", name_key, address_key) if name_key and address_key else None
+
+    domain_match = index.get(domain_key_tuple) if domain_key_tuple else None
+    phone_match = index.get(phone_key_tuple) if phone_key_tuple else None
+    name_address_match = index.get(name_address_key_tuple) if name_address_key_tuple else None
+
+    def _conflict(resolved_key: tuple, resolved_id: str, other_id: str) -> dict:
+        return {
+            "resolved_via_key": ":".join(str(part) for part in resolved_key),
+            "conflicting_master_ids": [other_id],
+        }
+
+    if domain_key_tuple is not None:
+        if domain_match is not None:
+            conflict = None
+            if phone_match is not None and phone_match != domain_match:
+                conflict = _conflict(domain_key_tuple, domain_match, phone_match)
+            return domain_match, conflict
+        # Domain present but brand-new to us: trust it over an incidental
+        # phone collision; only name+address may still attach this lead to
+        # a pre-existing record (the "website discovered later" case).
+        if name_address_match is not None:
+            return name_address_match, None
+        return None, None
+
+    if phone_key_tuple is not None:
+        if phone_match is not None:
+            conflict = None
+            if name_address_match is not None and name_address_match != phone_match:
+                conflict = _conflict(phone_key_tuple, phone_match, name_address_match)
+            return phone_match, conflict
+        if name_address_match is not None:
+            return name_address_match, None
+        return None, None
+
+    if name_address_match is not None:
+        return name_address_match, None
+    return None, None
 
 
 def _is_blank(value) -> bool:
@@ -164,11 +293,15 @@ def update_master(
     existing_master: dict[str, dict],
     existing_history_keys: set[tuple],
     existing_history_rows: list[dict],
+    existing_conflicts: list[dict] | None = None,
 ) -> tuple[list[dict], list[dict], dict]:
     """Pure function: returns (master_records, history_rows, stats)."""
     master = dict(existing_master)
     history_rows = list(existing_history_rows)
     history_keys = set(existing_history_keys)
+    conflicts = list(existing_conflicts or [])
+
+    identity_index = build_identity_index(master)
 
     new_records = 0
     updated_records = 0
@@ -183,7 +316,22 @@ def update_master(
         searches_seen.setdefault(row["master_id"], set()).add(row.get("search_id", ""))
 
     for lead in leads:
-        master_id = compute_master_id(lead)
+        resolved_id, conflict = resolve_master_id(lead, identity_index)
+        master_id = resolved_id if resolved_id is not None else compute_master_id(lead)
+
+        if conflict:
+            conflicts.append(
+                {
+                    "master_id": master_id,
+                    "resolved_via_key": conflict["resolved_via_key"],
+                    "conflicting_master_ids": "|".join(conflict["conflicting_master_ids"]),
+                    "business_name": lead.get("business_name") or "",
+                    "run_id": lead.get("run_id") or "",
+                    "search_id": lead.get("search_id") or "",
+                    "detected_at": lead.get("scraped_at") or "",
+                }
+            )
+
         existing = master.get(master_id)
         if existing is None:
             new_records += 1
@@ -192,6 +340,12 @@ def update_master(
 
         record = merge_lead_into_master(existing, lead, master_id)
         master[master_id] = record
+
+        # A newly-discovered identifier (e.g. a website found on a later
+        # scrape of a name+address-only business) must attach to this same
+        # master_id going forward, not mint a new record.
+        for key in match_keys(lead):
+            identity_index[key] = master_id
 
         scraped_at = lead.get("scraped_at") or ""
         run_id = lead.get("run_id") or ""
@@ -226,6 +380,9 @@ def update_master(
         "total_master_records": len(master),
         "new_history_events": new_history_events,
         "total_history_events": len(history_rows),
+        "new_identity_conflicts": len(conflicts) - len(existing_conflicts or []),
+        "total_identity_conflicts": len(conflicts),
+        "identity_conflicts": conflicts,
     }
     return list(master.values()), history_rows, stats
 
@@ -258,28 +415,50 @@ def write_history(rows: list[dict], master_dir: str) -> str:
     return history_path
 
 
+def load_conflicts(conflicts_csv_path: str) -> list[dict]:
+    if not os.path.exists(conflicts_csv_path):
+        return []
+    with open(conflicts_csv_path, newline="", encoding="utf-8") as f:
+        return list(csv.DictReader(f))
+
+
+def write_conflicts(rows: list[dict], master_dir: str) -> str:
+    rows = sorted(rows, key=lambda r: (r["master_id"], r["run_id"], r["search_id"]))
+    conflicts_path = os.path.join(master_dir, "identity_conflicts.csv")
+    with open(conflicts_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=CONFLICT_FIELDS, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({k: row.get(k, "") for k in CONFLICT_FIELDS})
+    return conflicts_path
+
+
 def run(clean_json_paths: list[str], master_dir: str) -> dict:
     os.makedirs(master_dir, exist_ok=True)
     leads = load_clean_leads(clean_json_paths)
 
     master_json_path = os.path.join(master_dir, "master.json")
     history_csv_path = os.path.join(master_dir, "discovery_history.csv")
+    conflicts_csv_path = os.path.join(master_dir, "identity_conflicts.csv")
 
     existing_master = load_master(master_json_path)
     existing_history_rows = load_history_rows(history_csv_path)
     existing_history_keys = load_history_keys(history_csv_path)
+    existing_conflicts = load_conflicts(conflicts_csv_path)
 
     records, history_rows, stats = update_master(
-        leads, existing_master, existing_history_keys, existing_history_rows
+        leads, existing_master, existing_history_keys, existing_history_rows, existing_conflicts
     )
 
     master_csv, master_json = write_master(records, master_dir)
     history_csv = write_history(history_rows, master_dir)
+    conflicts_csv = write_conflicts(stats.pop("identity_conflicts"), master_dir)
 
     stats["artifacts"] = {
         "master_csv": master_csv,
         "master_json": master_json,
         "discovery_history_csv": history_csv,
+        "identity_conflicts_csv": conflicts_csv,
     }
     return stats
 

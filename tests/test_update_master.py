@@ -220,6 +220,197 @@ class IdempotencyTests(unittest.TestCase):
         self.assertEqual(len(history2), 1)
 
 
+class IdentityResolutionTests(unittest.TestCase):
+    """Master identity must be resolved against the EXISTING master store
+    using all reliable identity keys, not recomputed fresh from whatever
+    fields happen to be present on the incoming lead (the Step 6A bug)."""
+
+    def test_website_present_then_missing_keeps_same_master(self):
+        run1 = make_lead(website="https://acehvac.com", phone="555-123-4567", run_id="run_1", search_id="s1")
+        records1, history1, _ = update_master.update_master([run1], {}, set(), [])
+        master_id_1 = records1[0]["master_id"]
+        existing_master = {r["master_id"]: r for r in records1}
+        existing_keys = {(h["master_id"], h["run_id"], h["search_id"]) for h in history1}
+
+        run2 = make_lead(website="", phone="", run_id="run_2", search_id="s2")
+        records2, _, stats2 = update_master.update_master([run2], existing_master, existing_keys, history1)
+        self.assertEqual(stats2["new_master_records"], 0)
+        self.assertEqual(stats2["updated_master_records"], 1)
+        self.assertEqual(records2[0]["master_id"], master_id_1)
+
+    def test_phone_present_then_missing_keeps_same_master(self):
+        run1 = make_lead(website="", phone="555-123-4567", run_id="run_1", search_id="s1")
+        records1, history1, _ = update_master.update_master([run1], {}, set(), [])
+        master_id_1 = records1[0]["master_id"]
+        existing_master = {r["master_id"]: r for r in records1}
+        existing_keys = {(h["master_id"], h["run_id"], h["search_id"]) for h in history1}
+
+        run2 = make_lead(website="", phone="", run_id="run_2", search_id="s2")
+        records2, _, stats2 = update_master.update_master([run2], existing_master, existing_keys, history1)
+        self.assertEqual(stats2["new_master_records"], 0)
+        self.assertEqual(stats2["updated_master_records"], 1)
+        self.assertEqual(records2[0]["master_id"], master_id_1)
+
+    def test_website_missing_first_then_discovered_attaches_to_existing(self):
+        run1 = make_lead(website="", phone="", run_id="run_1", search_id="s1")
+        records1, history1, _ = update_master.update_master([run1], {}, set(), [])
+        master_id_1 = records1[0]["master_id"]
+        existing_master = {r["master_id"]: r for r in records1}
+        existing_keys = {(h["master_id"], h["run_id"], h["search_id"]) for h in history1}
+
+        run2 = make_lead(website="https://acehvac.com", phone="", run_id="run_2", search_id="s2")
+        records2, _, stats2 = update_master.update_master([run2], existing_master, existing_keys, history1)
+        self.assertEqual(stats2["new_master_records"], 0)
+        self.assertEqual(stats2["updated_master_records"], 1)
+        self.assertEqual(records2[0]["master_id"], master_id_1)
+        self.assertEqual(records2[0]["website"], "https://acehvac.com")
+
+    def test_phone_missing_first_then_discovered_attaches_to_existing(self):
+        run1 = make_lead(website="", phone="", run_id="run_1", search_id="s1")
+        records1, history1, _ = update_master.update_master([run1], {}, set(), [])
+        master_id_1 = records1[0]["master_id"]
+        existing_master = {r["master_id"]: r for r in records1}
+        existing_keys = {(h["master_id"], h["run_id"], h["search_id"]) for h in history1}
+
+        run2 = make_lead(website="", phone="555-123-4567", run_id="run_2", search_id="s2")
+        records2, _, stats2 = update_master.update_master([run2], existing_master, existing_keys, history1)
+        self.assertEqual(stats2["new_master_records"], 0)
+        self.assertEqual(stats2["updated_master_records"], 1)
+        self.assertEqual(records2[0]["master_id"], master_id_1)
+        self.assertEqual(records2[0]["phone"], "555-123-4567")
+
+    def test_resolves_via_website_match(self):
+        run1 = make_lead(website="https://acehvac.com", phone="555-000-0001", run_id="run_1", search_id="s1")
+        records1, history1, _ = update_master.update_master([run1], {}, set(), [])
+        master_id_1 = records1[0]["master_id"]
+        existing_master = {r["master_id"]: r for r in records1}
+        existing_keys = {(h["master_id"], h["run_id"], h["search_id"]) for h in history1}
+
+        run2 = make_lead(website="https://www.acehvac.com", phone="", run_id="run_2", search_id="s2")
+        records2, _, stats2 = update_master.update_master([run2], existing_master, existing_keys, history1)
+        self.assertEqual(stats2["updated_master_records"], 1)
+        self.assertEqual(records2[0]["master_id"], master_id_1)
+
+    def test_resolves_via_phone_match_when_website_absent(self):
+        run1 = make_lead(website="", phone="555-000-0001", run_id="run_1", search_id="s1")
+        records1, history1, _ = update_master.update_master([run1], {}, set(), [])
+        master_id_1 = records1[0]["master_id"]
+        existing_master = {r["master_id"]: r for r in records1}
+        existing_keys = {(h["master_id"], h["run_id"], h["search_id"]) for h in history1}
+
+        run2 = make_lead(website="", phone="+1 555 000 0001", run_id="run_2", search_id="s2")
+        records2, _, stats2 = update_master.update_master([run2], existing_master, existing_keys, history1)
+        self.assertEqual(stats2["updated_master_records"], 1)
+        self.assertEqual(records2[0]["master_id"], master_id_1)
+
+    def test_resolves_via_name_address_fallback(self):
+        run1 = make_lead(website="", phone="", run_id="run_1", search_id="s1")
+        records1, history1, _ = update_master.update_master([run1], {}, set(), [])
+        master_id_1 = records1[0]["master_id"]
+        existing_master = {r["master_id"]: r for r in records1}
+        existing_keys = {(h["master_id"], h["run_id"], h["search_id"]) for h in history1}
+
+        run2 = make_lead(website="", phone="", run_id="run_2", search_id="s2")
+        records2, _, stats2 = update_master.update_master([run2], existing_master, existing_keys, history1)
+        self.assertEqual(stats2["updated_master_records"], 1)
+        self.assertEqual(records2[0]["master_id"], master_id_1)
+
+    def test_multiple_keys_all_pointing_to_same_master_no_conflict(self):
+        run1 = make_lead(website="https://acehvac.com", phone="555-000-0001", run_id="run_1", search_id="s1")
+        records1, history1, _ = update_master.update_master([run1], {}, set(), [])
+        master_id_1 = records1[0]["master_id"]
+        existing_master = {r["master_id"]: r for r in records1}
+        existing_keys = {(h["master_id"], h["run_id"], h["search_id"]) for h in history1}
+
+        # Same website, same phone, same name/address: all three keys agree.
+        run2 = make_lead(website="https://acehvac.com", phone="555-000-0001", run_id="run_2", search_id="s2")
+        records2, _, stats2 = update_master.update_master([run2], existing_master, existing_keys, history1)
+        self.assertEqual(stats2["updated_master_records"], 1)
+        self.assertEqual(records2[0]["master_id"], master_id_1)
+        self.assertEqual(stats2["new_identity_conflicts"], 0)
+
+    def test_multiple_keys_pointing_to_different_masters_reports_conflict(self):
+        a = make_lead(business_name="Ace HVAC", website="https://acehvac.com", phone="555-000-0001", address="1 A St, Dallas, TX 75201", run_id="run_1", search_id="s1")
+        b = make_lead(business_name="Beta Air", website="https://betaair.com", phone="555-000-0002", address="2 B St, Dallas, TX 75201", run_id="run_1", search_id="s2")
+        records1, history1, _ = update_master.update_master([a, b], {}, set(), [])
+        existing_master = {r["master_id"]: r for r in records1}
+        existing_keys = {(h["master_id"], h["run_id"], h["search_id"]) for h in history1}
+        master_a = update_master.compute_master_id(a)
+        master_b = update_master.compute_master_id(b)
+
+        # A single incoming record whose website points to master A but
+        # whose phone points to master B -- a genuine identity collision.
+        colliding = make_lead(business_name="Ace HVAC", website="https://acehvac.com", phone="555-000-0002", address="1 A St, Dallas, TX 75201", run_id="run_2", search_id="s3")
+        records2, _, stats2 = update_master.update_master([colliding], existing_master, existing_keys, history1)
+        self.assertEqual(stats2["new_identity_conflicts"], 1)
+        conflict = stats2["identity_conflicts"][-1]
+        self.assertEqual(conflict["master_id"], master_a)
+        self.assertEqual(conflict["conflicting_master_ids"], master_b)
+        # Resolved deterministically via the higher-priority key (domain);
+        # never silently merged into a third state.
+        by_id = {r["master_id"]: r for r in records2}
+        self.assertIn(master_a, by_id)
+        self.assertIn(master_b, by_id)
+
+    def test_brand_new_business_with_no_website_or_phone(self):
+        lead = make_lead(website="", phone="", business_name="Brand New Biz", address="9 New Rd, Dallas, TX 75201")
+        records, _, stats = update_master.update_master([lead], {}, set(), [])
+        self.assertEqual(stats["new_master_records"], 1)
+        self.assertEqual(len(records), 1)
+
+    def test_stable_master_id_across_three_runs_with_shrinking_fields(self):
+        run1 = make_lead(website="https://acehvac.com", phone="555-000-0001", run_id="run_1", search_id="s1")
+        records1, history1, _ = update_master.update_master([run1], {}, set(), [])
+        master_id = records1[0]["master_id"]
+        existing_master = {r["master_id"]: r for r in records1}
+        existing_keys = {(h["master_id"], h["run_id"], h["search_id"]) for h in history1}
+
+        run2 = make_lead(website="", phone="555-000-0001", run_id="run_2", search_id="s2")
+        records2, history2, _ = update_master.update_master([run2], existing_master, existing_keys, history1)
+        self.assertEqual(records2[0]["master_id"], master_id)
+        existing_master = {r["master_id"]: r for r in records2}
+        existing_keys = {(h["master_id"], h["run_id"], h["search_id"]) for h in history2}
+
+        run3 = make_lead(website="", phone="", run_id="run_3", search_id="s3")
+        records3, _, stats3 = update_master.update_master([run3], existing_master, existing_keys, history2)
+        self.assertEqual(records3[0]["master_id"], master_id)
+        self.assertEqual(stats3["new_master_records"], 0)
+
+    def test_no_duplicate_created_when_identifying_fields_disappear(self):
+        run1 = make_lead(website="https://acehvac.com", phone="555-000-0001", run_id="run_1", search_id="s1")
+        records1, history1, _ = update_master.update_master([run1], {}, set(), [])
+        existing_master = {r["master_id"]: r for r in records1}
+        existing_keys = {(h["master_id"], h["run_id"], h["search_id"]) for h in history1}
+
+        run2 = make_lead(website="", phone="", run_id="run_2", search_id="s2")
+        records2, _, stats2 = update_master.update_master([run2], existing_master, existing_keys, history1)
+        self.assertEqual(len(records2), 1)
+        self.assertEqual(stats2["total_master_records"], 1)
+
+    def test_idempotent_reprocessing_with_identity_index(self):
+        lead = make_lead(website="https://acehvac.com", phone="555-000-0001")
+        records1, history1, _ = update_master.update_master([lead], {}, set(), [])
+        existing_master = {r["master_id"]: r for r in records1}
+        existing_keys = {(h["master_id"], h["run_id"], h["search_id"]) for h in history1}
+
+        records2, _, stats2 = update_master.update_master([lead], existing_master, existing_keys, history1)
+        self.assertEqual(stats2["new_master_records"], 0)
+        self.assertEqual(stats2["updated_master_records"], 1)
+        self.assertEqual(len(records2), 1)
+
+    def test_identity_index_rebuild_from_existing_master_data(self):
+        lead = make_lead(website="https://acehvac.com", phone="555-000-0001")
+        records, _, _ = update_master.update_master([lead], {}, set(), [])
+        master = {r["master_id"]: r for r in records}
+
+        index = update_master.build_identity_index(master)
+        self.assertEqual(index[("domain", "acehvac.com")], records[0]["master_id"])
+        self.assertEqual(index[("phone", "5550000001")], records[0]["master_id"])
+        name_key = update_master.normalize_name_key(lead["business_name"])
+        address_key = update_master.normalize_address_key(lead["address"])
+        self.assertEqual(index[("name_address", name_key, address_key)], records[0]["master_id"])
+
+
 class ReadWriteRoundTripTests(unittest.TestCase):
     def test_write_and_reload_master_round_trips(self):
         import tempfile
