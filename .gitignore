@@ -1,0 +1,21 @@
+# Generated Google Maps scrape datasets - do not commit lead databases
+# by accident. Remove/override these rules explicitly if a specific
+# dataset should be kept in git history.
+data/google-maps/raw/*
+data/google-maps/clean/*
+!data/google-maps/raw/.gitkeep
+!data/google-maps/clean/.gitkeep
+
+queries.txt
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Go build output (upstream scraper checked out at repo root during CI)
+/google-maps-scraper/
+*.exe
+
+# OS
+.DS_Store
