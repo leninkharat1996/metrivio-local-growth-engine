@@ -66,6 +66,8 @@ class ScoringScenarioTests(unittest.TestCase):
         )
         self.assertIn(result["icp_tier"], ("A", "A+"))
         self.assertEqual(result["icp_exclusions"], [])
+        self.assertEqual(result["icp_status"], "qualified")
+        self.assertEqual(result["icp_confidence"], "high")
 
     def test_residential_only_hvac_is_tier_d(self):
         result = qualify_one(
@@ -74,6 +76,8 @@ class ScoringScenarioTests(unittest.TestCase):
         )
         self.assertEqual(result["icp_tier"], "D")
         self.assertTrue(any("residential-only" in r for r in result["icp_exclusions"]))
+        self.assertEqual(result["icp_status"], "excluded")
+        self.assertIn("residential_only_signal", result["icp_evidence"])
 
     def test_mixed_residential_and_commercial_not_auto_rejected(self):
         result = qualify_one(
@@ -82,6 +86,7 @@ class ScoringScenarioTests(unittest.TestCase):
         )
         self.assertNotEqual(result["icp_tier"], "D")
         self.assertEqual(result["icp_exclusions"], [])
+        self.assertNotEqual(result["icp_status"], "excluded")
 
     def test_distributor_is_tier_d(self):
         result = qualify_one(
@@ -90,6 +95,7 @@ class ScoringScenarioTests(unittest.TestCase):
         )
         self.assertEqual(result["icp_tier"], "D")
         self.assertTrue(len(result["icp_exclusions"]) >= 1)
+        self.assertEqual(result["icp_status"], "excluded")
 
     def test_non_us_country_is_tier_d(self):
         result = qualify_one(
@@ -99,6 +105,7 @@ class ScoringScenarioTests(unittest.TestCase):
         )
         self.assertEqual(result["icp_tier"], "D")
         self.assertTrue(any("country" in r for r in result["icp_exclusions"]))
+        self.assertEqual(result["icp_status"], "excluded")
 
     def test_plumbing_only_is_tier_d(self):
         result = qualify_one(
@@ -107,6 +114,7 @@ class ScoringScenarioTests(unittest.TestCase):
         )
         self.assertEqual(result["icp_tier"], "D")
         self.assertTrue(any("plumbing_only" in r for r in result["icp_exclusions"]))
+        self.assertEqual(result["icp_status"], "excluded")
 
     def test_electrical_only_is_tier_d(self):
         result = qualify_one(
@@ -171,6 +179,106 @@ class ScoringScenarioTests(unittest.TestCase):
             category="government facilities management",
         )
         self.assertEqual(result["icp_tier"], "D")
+        self.assertEqual(result["icp_status"], "excluded")
+
+
+class StatusAndConfidenceTests(unittest.TestCase):
+    def test_generic_hvac_contractor_no_commercial_keyword_lands_in_review(self):
+        # "ABC Mechanical Services" / "HVAC contractor" -- generic, no
+        # explicit commercial keyword -- must be review, not a
+        # high-confidence qualification.
+        result = qualify_one(
+            business_name="ABC Mechanical Services",
+            category="HVAC contractor",
+            website="https://abcmech.com",
+            rating=4.8,
+            review_count=200,
+        )
+        self.assertEqual(result["icp_status"], "review")
+        self.assertNotEqual(result["icp_confidence"], "high")
+        self.assertEqual(result["icp_exclusions"], [])
+
+    def test_explicit_commercial_mechanical_qualifies_stronger(self):
+        # "ABC Commercial Mechanical Services" / "HVAC contractor" --
+        # explicit commercial keyword -- should qualify or at least score
+        # meaningfully higher than the generic case above.
+        generic = qualify_one(
+            business_name="ABC Mechanical Services",
+            category="HVAC contractor",
+        )
+        commercial = qualify_one(
+            business_name="ABC Commercial Mechanical Services",
+            category="HVAC contractor",
+        )
+        self.assertGreater(commercial["icp_score"], generic["icp_score"])
+        self.assertEqual(commercial["icp_confidence"], "high")
+        self.assertEqual(commercial["icp_status"], "qualified")
+
+    def test_joes_heating_and_air_generic_lands_in_review(self):
+        result = qualify_one(
+            business_name="Joe's Heating & Air",
+            category="HVAC contractor",
+        )
+        self.assertEqual(result["icp_status"], "review")
+        self.assertEqual(result["icp_exclusions"], [])
+
+    def test_joes_residential_heating_and_air_is_excluded(self):
+        result = qualify_one(
+            business_name="Joe's Residential Heating & Air",
+            category="HVAC contractor",
+        )
+        self.assertEqual(result["icp_status"], "excluded")
+        self.assertEqual(result["icp_tier"], "D")
+
+    def test_metro_hvac_and_plumbing_not_excluded_for_plumbing(self):
+        result = qualify_one(
+            business_name="Metro HVAC & Plumbing",
+            category="HVAC contractor",
+        )
+        self.assertNotEqual(result["icp_status"], "excluded")
+        self.assertEqual(result["icp_exclusions"], [])
+
+    def test_hvac_supply_store_is_excluded(self):
+        result = qualify_one(
+            business_name="ABC HVAC Supply",
+            category="HVAC supply store",
+        )
+        self.assertEqual(result["icp_status"], "excluded")
+        self.assertEqual(result["icp_tier"], "D")
+
+    def test_commercial_hvac_contractor_qualifies_high_confidence(self):
+        result = qualify_one(
+            business_name="ABC Commercial HVAC",
+            category="commercial HVAC contractor",
+        )
+        self.assertEqual(result["icp_status"], "qualified")
+        self.assertEqual(result["icp_confidence"], "high")
+        self.assertIn("commercial_hvac_signal", result["icp_evidence"])
+
+    def test_bonuses_alone_never_produce_high_confidence(self):
+        # High rating/review count but no commercial keyword evidence at
+        # all -- must never be high-confidence qualified from bonuses.
+        result = qualify_one(
+            business_name="XYZ Enterprises",
+            category="",
+            website="https://xyz.example.com",
+            rating=4.9,
+            review_count=500,
+        )
+        self.assertNotEqual(result["icp_confidence"], "high")
+        self.assertNotEqual(result["icp_status"], "qualified")
+
+    def test_evidence_never_contains_invented_conclusions(self):
+        result = qualify_one(
+            business_name="ABC Commercial HVAC",
+            category="commercial HVAC contractor",
+            rating=4.9,
+            review_count=500,
+            employee_count=25,
+        )
+        allowed = set(qualify.EVIDENCE_VOCABULARY)
+        for tag in result["icp_evidence"]:
+            self.assertIn(tag, allowed)
 
 
 class DeterminismTests(unittest.TestCase):

@@ -1,7 +1,8 @@
 {
   "$schema": "https://metrivio.local/icp_rules.schema.json",
-  "description": "Deterministic ICP (Ideal Customer Profile) qualification rules for the master prospect store. Pure rule-based text matching against fields that genuinely exist in data/master/master.json -- no AI/LLM calls, no enrichment, no invented fields (no employee count, revenue, or capacity data unless it is already present on the record).",
-  "version": 1,
+  "concept": "Preliminary ICP Qualification",
+  "description": "Deterministic PRELIMINARY ICP (Ideal Customer Profile) qualification rules for the master prospect store. Pure rule-based text matching against fields that genuinely exist in data/master/master.json (business name, category/type, website presence, rating, review_count, address/city/state/country, employee_count if present) -- no AI/LLM calls, no enrichment, no invented fields (no revenue, capacity, or true commercial specialization data, since this layer does not and cannot know those with certainty from currently-available fields). This layer produces a preliminary status/confidence/score; final ICP qualification requires later website/business enrichment that does not exist yet in this repo.",
+  "version": 2,
 
   "fields_considered": [
     "business_name",
@@ -119,7 +120,7 @@
   },
 
   "strong_commercial_service_signals": {
-    "description": "Keywords in business_name/category indicating the business itself is a commercial-focused HVAC/mechanical service provider. Additive points, matched independently (a record may match several).",
+    "description": "Keywords in business_name/category providing DIRECT evidence that the business itself is a commercial-focused HVAC/mechanical service provider. These are the only keywords capable of producing icp_confidence 'high' on their own (tagged icp_evidence 'commercial_hvac_signal', or 'industrial_signal' for the industrial-specific ones). Additive points, matched independently (a record may match several).",
     "points_each": 15,
     "max_points": 45,
     "keywords": [
@@ -128,16 +129,24 @@
       "industrial hvac",
       "commercial refrigeration",
       "commercial air conditioning",
-      "mechanical contractor",
-      "mechanical contractors",
       "commercial heating",
       "commercial cooling",
       "building automation",
+      "hvac controls",
       "energy management",
       "chiller",
       "rooftop unit",
+      "rtu",
       "boiler service"
-    ]
+    ],
+    "industrial_keywords": ["industrial hvac", "industrial"]
+  },
+
+  "mechanical_contractor_signal": {
+    "description": "'mechanical contractor'/'mechanical contractors' is direct-but-ambiguous: it only counts as strong DIRECT commercial evidence (icp_evidence 'commercial_service_signal', contributes to icp_confidence 'high') when combined with a general HVAC signal elsewhere in the text -- otherwise 'mechanical contractor' alone could mean plumbing/other trades and is not treated as direct HVAC evidence.",
+    "points_each": 15,
+    "max_points": 15,
+    "keywords": ["mechanical contractor", "mechanical contractors"]
   },
 
   "commercial_customer_vertical_signals": {
@@ -197,14 +206,44 @@
     }
   },
 
+  "confidence_rules": {
+    "description": "icp_confidence is driven ONLY by direct keyword evidence (strong_commercial_service_signals / mechanical_contractor_signal / commercial_customer_vertical_signals / general_hvac_signal matches). Generic secondary bonuses (website, rating, review_count, employee_count) can NEVER by themselves produce 'high' or upgrade 'low' to 'medium' -- they may only be reported as supporting icp_evidence tags alongside a keyword-derived confidence.",
+    "high": "At least one strong_commercial_service_signals keyword matched, OR mechanical_contractor_signal matched together with a general_hvac_signal match.",
+    "medium": "general_hvac_signal matched AND at least one commercial_customer_vertical_signals keyword matched, but no 'high' condition met.",
+    "low": "Anything else (no signal, or only a general_hvac_signal match with no vertical signal, or only bonus signals)."
+  },
+
+  "status_rules": {
+    "description": "icp_status is the PRIMARY downstream decision. icp_tier remains a secondary, transparent numeric classification.",
+    "excluded": "Any hard exclusion or residential-only exclusion matched.",
+    "qualified": "No exclusion, AND (icp_confidence == 'high' OR (icp_confidence == 'medium' AND icp_score >= qualified_min_score_for_medium_confidence)).",
+    "review": "No exclusion, and the 'qualified' condition is not met -- potentially relevant but current evidence is insufficient to confidently qualify. This is an EXPECTED, intentional outcome, not a failure of the record or the rules.",
+    "qualified_min_score_for_medium_confidence": 65
+  },
+
   "insufficient_evidence_penalty": {
     "description": "Records with almost no signal at all (no HVAC-relevant category text, no website, no rating/review data) are capped so they cannot reach A/A+ purely on the base score.",
     "cap_score_when_no_positive_signals": 34
   },
 
+  "evidence_vocabulary": [
+    "commercial_hvac_signal",
+    "industrial_signal",
+    "commercial_service_signal",
+    "commercial_vertical_signal",
+    "general_hvac_signal",
+    "website_present",
+    "strong_rating",
+    "strong_review_count",
+    "employee_count_signal",
+    "hard_exclusion",
+    "residential_only_signal"
+  ],
+
   "notes": [
     "Scoring is purely additive/subtractive over base_score using the sections above; no field is invented that isn't already in data/master/master.json.",
-    "Hard exclusions and the residential-only exclusion both force tier D by setting an icp_excluded flag that overrides the numeric tier lookup, but the numeric score is still computed and reported for transparency.",
-    "All keyword matching is case-insensitive substring matching over business_name and category text -- deterministic, no fuzzy/AI matching."
+    "Hard exclusions and the residential-only exclusion both force tier D and icp_status 'excluded' by setting an icp_excluded flag that overrides the numeric tier lookup, but the numeric score is still computed and reported for transparency.",
+    "All keyword matching is case-insensitive substring matching over business_name and category text -- deterministic, no fuzzy/AI matching.",
+    "This is a PRELIMINARY qualification layer only. It cannot know true revenue, capacity, or commercial specialization with certainty -- it only reasons over currently-available Google Maps/master-store fields. Final ICP qualification requires later website/business enrichment not built in this repo."
   ]
 }

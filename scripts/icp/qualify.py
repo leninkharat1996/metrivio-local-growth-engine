@@ -1,6 +1,15 @@
 #!/usr/bin/env python3
 """
-Deterministic, explainable ICP (Ideal Customer Profile) qualification layer.
+Deterministic, explainable PRELIMINARY ICP (Ideal Customer Profile)
+qualification layer.
+
+This layer reasons ONLY over fields that already exist on a master record
+today (business name, category/type, website presence, rating,
+review_count, address/city/state/country, and employee_count if present).
+It does NOT know revenue, capacity, or true commercial specialization with
+certainty -- those require later website/business enrichment that is not
+built here. Every result is therefore "preliminary": icp_status 'review'
+is an expected, intentional outcome for ambiguous records, not a failure.
 
 Reads the persistent master prospect store (data/master/master.json,
 produced by scripts/google_maps_scraper/update_master.py) and scores each
@@ -37,6 +46,20 @@ import os
 import sys
 from datetime import datetime, timezone
 
+EVIDENCE_VOCABULARY = [
+    "commercial_hvac_signal",
+    "industrial_signal",
+    "commercial_service_signal",
+    "commercial_vertical_signal",
+    "general_hvac_signal",
+    "website_present",
+    "strong_rating",
+    "strong_review_count",
+    "employee_count_signal",
+    "hard_exclusion",
+    "residential_only_signal",
+]
+
 OUTPUT_FIELDS = [
     "master_id",
     "business_name",
@@ -50,6 +73,9 @@ OUTPUT_FIELDS = [
     "review_count",
     "icp_tier",
     "icp_score",
+    "icp_status",
+    "icp_confidence",
+    "icp_evidence",
     "icp_reasons",
     "icp_exclusions",
     "icp_evaluated_at",
@@ -121,15 +147,17 @@ def evaluate_residential_only(record: dict, rules: dict, text: str) -> list[str]
     ]
 
 
-def evaluate_positive_signals(record: dict, rules: dict, text: str) -> tuple[int, list[str]]:
+def evaluate_positive_signals(record: dict, rules: dict, text: str) -> tuple[int, list[str], set[str]]:
     score = rules["base_score"]
     reasons = [f"base score: {rules['base_score']}"]
+    evidence: set[str] = set()
 
     general = rules["general_hvac_signal"]
     general_matched = _contains_any(text, general["keywords"])
     if general_matched:
         score += general["points"]
         reasons.append(f"+{general['points']}: HVAC/mechanical signal ({general_matched[0]})")
+        evidence.add("general_hvac_signal")
 
     strong = rules["strong_commercial_service_signals"]
     strong_matched = _contains_any(text, strong["keywords"])
@@ -139,6 +167,22 @@ def evaluate_positive_signals(record: dict, rules: dict, text: str) -> tuple[int
         reasons.append(
             f"+{strong_points}: strong commercial service signal(s) {strong_matched}"
         )
+        evidence.add("commercial_hvac_signal")
+        if _contains_any(text, strong.get("industrial_keywords", [])):
+            evidence.add("industrial_signal")
+
+    # 'mechanical contractor' is direct-but-ambiguous evidence: it only
+    # counts as strong DIRECT commercial evidence when paired with a
+    # general HVAC signal elsewhere in the text (otherwise it could be a
+    # plumbing/other-trade mechanical contractor).
+    mech = rules["mechanical_contractor_signal"]
+    mech_matched = _contains_any(text, mech["keywords"])
+    mech_points = min(len(mech_matched) * mech["points_each"], mech["max_points"])
+    if mech_matched:
+        score += mech_points
+        reasons.append(f"+{mech_points}: mechanical contractor signal {mech_matched}")
+        if general_matched:
+            evidence.add("commercial_service_signal")
 
     vertical = rules["commercial_customer_vertical_signals"]
     vertical_matched = _contains_any(text, vertical["keywords"])
@@ -148,6 +192,7 @@ def evaluate_positive_signals(record: dict, rules: dict, text: str) -> tuple[int
         reasons.append(
             f"+{vertical_points}: commercial customer/vertical signal(s) {vertical_matched}"
         )
+        evidence.add("commercial_vertical_signal")
 
     bonus = rules["bonus_signals"]
 
@@ -155,6 +200,7 @@ def evaluate_positive_signals(record: dict, rules: dict, text: str) -> tuple[int
     if website:
         score += bonus["has_website"]["points"]
         reasons.append(f"+{bonus['has_website']['points']}: has a website on file")
+        evidence.add("website_present")
 
     rating = record.get("rating")
     if isinstance(rating, (int, float)) and rating >= bonus["rating_at_least"]["threshold"]:
@@ -162,6 +208,7 @@ def evaluate_positive_signals(record: dict, rules: dict, text: str) -> tuple[int
         reasons.append(
             f"+{bonus['rating_at_least']['points']}: rating {rating} >= {bonus['rating_at_least']['threshold']}"
         )
+        evidence.add("strong_rating")
 
     review_count = record.get("review_count")
     if isinstance(review_count, (int, float)):
@@ -170,9 +217,11 @@ def evaluate_positive_signals(record: dict, rules: dict, text: str) -> tuple[int
         if review_count >= low_cfg["threshold"]:
             score += low_cfg["points"]
             reasons.append(f"+{low_cfg['points']}: review_count {review_count} >= {low_cfg['threshold']}")
+            evidence.add("strong_review_count")
         if review_count >= high_cfg["threshold"]:
             score += high_cfg["points"]
             reasons.append(f"+{high_cfg['points']}: review_count {review_count} >= {high_cfg['threshold']}")
+            evidence.add("strong_review_count")
 
     emp_cfg = bonus["employee_count_present"]
     employee_count = None
@@ -187,14 +236,16 @@ def evaluate_positive_signals(record: dict, rules: dict, text: str) -> tuple[int
             reasons.append(
                 f"+{emp_cfg['points_mid']}: employee count {employee_count} >= {emp_cfg['mid_min']} (bonus only, never required)"
             )
+            evidence.add("employee_count_signal")
         elif employee_count >= emp_cfg["small_min"]:
             score += emp_cfg["points_small"]
             reasons.append(
                 f"+{emp_cfg['points_small']}: employee count {employee_count} >= {emp_cfg['small_min']} (bonus only, never required)"
             )
+            evidence.add("employee_count_signal")
 
     has_any_positive_signal = bool(
-        general_matched or strong_matched or vertical_matched or website
+        general_matched or strong_matched or mech_matched or vertical_matched or website
         or isinstance(rating, (int, float)) or isinstance(review_count, (int, float))
     )
     if not has_any_positive_signal:
@@ -205,7 +256,29 @@ def evaluate_positive_signals(record: dict, rules: dict, text: str) -> tuple[int
             )
             score = cap
 
-    return score, reasons
+    return score, reasons, evidence
+
+
+def evaluate_confidence(evidence: set[str]) -> str:
+    """icp_confidence is driven ONLY by direct keyword evidence. Generic
+    secondary bonuses (website/rating/review_count/employee_count) can
+    never by themselves produce 'high' or upgrade 'low' to 'medium'."""
+    if "commercial_hvac_signal" in evidence or "commercial_service_signal" in evidence:
+        return "high"
+    if "general_hvac_signal" in evidence and "commercial_vertical_signal" in evidence:
+        return "medium"
+    return "low"
+
+
+def evaluate_status(exclusions: list[str], confidence: str, score: int, rules: dict) -> str:
+    if exclusions:
+        return "excluded"
+    min_score_medium = rules["status_rules"]["qualified_min_score_for_medium_confidence"]
+    if confidence == "high":
+        return "qualified"
+    if confidence == "medium" and score >= min_score_medium:
+        return "qualified"
+    return "review"
 
 
 def score_to_tier(score: int, rules: dict) -> str:
@@ -220,15 +293,24 @@ def score_to_tier(score: int, rules: dict) -> str:
 def qualify_record(record: dict, rules: dict, evaluated_at: str) -> dict:
     text = _lower(record.get("business_name"), record.get("category"))
 
-    exclusions = evaluate_hard_exclusions(record, rules, text)
-    exclusions += evaluate_residential_only(record, rules, text)
+    hard_exclusions = evaluate_hard_exclusions(record, rules, text)
+    residential_exclusions = evaluate_residential_only(record, rules, text)
+    exclusions = hard_exclusions + residential_exclusions
 
-    score, reasons = evaluate_positive_signals(record, rules, text)
+    score, reasons, evidence = evaluate_positive_signals(record, rules, text)
+
+    if hard_exclusions:
+        evidence.add("hard_exclusion")
+    if residential_exclusions:
+        evidence.add("residential_only_signal")
 
     if exclusions:
         tier = "D"
     else:
         tier = score_to_tier(score, rules)
+
+    confidence = evaluate_confidence(evidence)
+    status = evaluate_status(exclusions, confidence, score, rules)
 
     return {
         "master_id": record.get("master_id"),
@@ -243,6 +325,9 @@ def qualify_record(record: dict, rules: dict, evaluated_at: str) -> dict:
         "review_count": record.get("review_count"),
         "icp_tier": tier,
         "icp_score": score,
+        "icp_status": status,
+        "icp_confidence": confidence,
+        "icp_evidence": sorted(evidence),
         "icp_reasons": reasons,
         "icp_exclusions": exclusions,
         "icp_evaluated_at": evaluated_at,
@@ -271,6 +356,7 @@ def write_outputs(results: list[dict], out_dir: str) -> tuple[str, str]:
             flat = dict(row)
             flat["icp_reasons"] = " | ".join(row.get("icp_reasons") or [])
             flat["icp_exclusions"] = " | ".join(row.get("icp_exclusions") or [])
+            flat["icp_evidence"] = " | ".join(row.get("icp_evidence") or [])
             writer.writerow({k: ("" if flat.get(k) is None else flat.get(k)) for k in OUTPUT_FIELDS})
 
     return json_path, csv_path
@@ -285,12 +371,18 @@ def run(master_json_path: str, rules_path: str, out_dir: str, evaluated_at: str 
     json_path, csv_path = write_outputs(results, out_dir)
 
     tier_counts: dict[str, int] = {}
+    status_counts: dict[str, int] = {}
+    confidence_counts: dict[str, int] = {}
     for row in results:
         tier_counts[row["icp_tier"]] = tier_counts.get(row["icp_tier"], 0) + 1
+        status_counts[row["icp_status"]] = status_counts.get(row["icp_status"], 0) + 1
+        confidence_counts[row["icp_confidence"]] = confidence_counts.get(row["icp_confidence"], 0) + 1
 
     return {
         "records_evaluated": len(results),
         "tier_counts": tier_counts,
+        "status_counts": status_counts,
+        "confidence_counts": confidence_counts,
         "artifacts": {"icp_json": json_path, "icp_csv": csv_path},
     }
 
