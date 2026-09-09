@@ -1,0 +1,16 @@
+# Python dependencies for this repo.
+#
+# The Google Maps collection layer (scripts/google_maps_scraper/) and the
+# preliminary ICP layer (scripts/icp/) are deliberately stdlib-only and need
+# nothing here. The Step 9 website enrichment layer
+# (scripts/enrichment/enrich_websites.py) is the first layer with a
+# third-party dependency: Scrapling (https://github.com/D4Vinci/Scrapling),
+# a free/open-source (BSD-3-Clause) fetching + HTML parsing framework.
+#
+# The [fetchers] extra is what ships Scrapling's plain HTTP `Fetcher`. We use
+# ONLY that plain fetcher and Scrapling's parser/selector API -- never
+# StealthyFetcher, anti-bot bypass, CAPTCHA solving, proxy rotation or
+# fingerprint spoofing.
+#
+# Install with:  python3 -m pip install -r requirements.txt
+scrapling[fetchers]==0.4.15

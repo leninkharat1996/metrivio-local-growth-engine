@@ -274,6 +274,132 @@ sync, and no outreach happen here or anywhere else in this repo yet. A
 future enrichment step (website/business-level lookups) would be needed
 to move `review` records to a final, confident qualification.
 
+## Step 9 -- Website Enrichment
+
+A free/open-source, GitHub-Actions-compatible **evidence-collection**
+layer on top of the master prospect store: `scripts/enrichment/
+enrich_websites.py` reads the `website` field already present on each
+master record (read-only, never mutates `data/master/`) and crawls the
+homepage plus a small number of same-domain internal pages to collect
+factual, publicly-visible website evidence for a later, not-yet-built ICP
+qualification step.
+
+**Dependency -- Scrapling:** website fetching and HTML parsing both go
+through [Scrapling](https://github.com/D4Vinci/Scrapling), a free/open-
+source Python fetching + parsing framework. It is pinned in the repo's
+`requirements.txt` (the first third-party dependency in this repo -- the
+Google Maps and ICP layers remain stdlib-only):
+
+```
+python3 -m pip install -r requirements.txt   # scrapling[fetchers]==0.4.15
+```
+
+Only Scrapling's **plain HTTP `Fetcher`** and its parser/selector API are
+used, wrapped in a single adapter (`scripts/enrichment/scrapling_client.py`)
+that is also the only place tests substitute a fake. `StealthyFetcher`,
+`DynamicFetcher`, browser-fingerprint impersonation, stealth headers,
+proxies/proxy rotation and CAPTCHA solving are **never used** -- if a site
+blocks us we record the failure and stop crawling that domain.
+
+**What it is not:** this layer makes **no final ICP decisions**. It does
+not score, tier, qualify, or exclude a business -- it only records what a
+website literally says, with a page URL and a text snippet for every
+match, so a future qualification layer can judge strength on its own.
+There is **no AI/LLM call anywhere in this layer** -- evidence extraction
+is pure deterministic keyword matching (`scripts/enrichment/
+vocabulary.py`), matching the existing preliminary ICP layer's no-AI
+philosophy. No paid APIs, no email/phone/individual-name/LinkedIn/social-
+profile extraction, no CRM sync, no outreach.
+
+**Inputs:** `data/master/master.json` (read-only) and an optional JSON
+config overriding crawl defaults (`max_pages_per_domain`,
+`request_timeout`, `user_agent`, `max_text_length`, `max_snippet_length`,
+`allowed_schemes`, `respect_robots_txt`).
+
+**Crawl scope and page limit:** homepage + same-domain internal pages
+only -- external domains are never followed. Discovered links are
+normalized (fragment stripped, tracking params like `utm_*`/`gclid`/
+`fbclid` stripped, deduped) and links whose URL/anchor text look
+commercially relevant (services, commercial, industries, maintenance,
+about, contact, or any evidence keyword) are prioritized. Default cap:
+**5 pages per domain** (`--max-pages` / `max_pages_per_domain`). A simple,
+best-effort `robots.txt` check is applied per domain (matching user-agent
+or `*` group, longest-prefix Allow/Disallow) and fails open (treated as
+allowed) if `robots.txt` cannot be fetched or parsed.
+
+**Evidence philosophy -- factual extraction, not classification:** every
+match against the fixed vocabulary (commercial HVAC/mechanical terms,
+commercial service-delivery terms like preventive maintenance/service
+contracts, commercial customer-vertical terms like warehouse/healthcare/
+property management, and residential terms) is recorded as a
+`{category, keyword, page_url, snippet, evidence_type}` evidence item -- literal keyword
+matches only, never an inferred conclusion like "this is a commercial
+HVAC company." `evidence_type` is itself decided by fixed literal marker
+phrases, never by inference: `direct_service` (a service-verb phrase such
+as "we provide/offer/install/service/repair/maintain" appears in the same
+sentence), `customer_vertical` (a customer/building-type term),
+`residential`, or `incidental` -- a product/brand/parts context such as
+"we install HVAC products from leading manufacturers", which does **not**
+prove HVAC contracting. Incidental deliberately beats direct_service when
+both marker kinds are present, so the layer under-claims rather than
+over-claims. Evidence lists are sorted deterministically (category,
+then page_url, then keyword), and the same input + config always produces
+the same output (aside from crawl timestamps, which `--crawled-at`-style
+determinism in tests pins via an injectable clock).
+
+**Failure handling:** every record is processed independently and a
+broken page or site never stops the batch. `website_status` per record is
+one of: `success`, `partial` (some pages crawled, some failed),
+`no_website` (no website field -- no HTTP request attempted), `invalid_url`
+(unparseable or disallowed scheme -- no HTTP request attempted), `blocked`
+(HTTP 403/429), `timeout`, `http_error` (other 4xx/5xx), `non_html`
+(non-HTML content-type), `connection_error`, or `failed` (any other
+request error). Per-page failures are collected in `crawl_errors`.
+
+**Output schema** (`data/enrichment/website_enrichment.json` and `.csv`,
+one row per master record): `master_id`, `business_name`, `website`,
+`website_status`, `http_status`, `final_url`, `crawl_started_at`,
+`crawl_completed_at`, `pages_attempted`, `pages_crawled`, `pages_failed`, `homepage_title`,
+`homepage_description`, `commercial_hvac_signals`,
+`commercial_service_signals`, `commercial_vertical_signals`,
+`residential_signals` (rollup counts), `evidence` (the full structured
+evidence list), `crawl_errors`. The JSON file wraps these as
+`{"stats": {...}, "records": [...]}`, where the stats block carries
+`records_seen`, `records_with_websites`, `no_website`, `successful`,
+`partial`, `blocked`, `failed`, `pages_attempted`, `pages_successful` and
+`pages_failed`; the CSV is the flattened one-row-per-record summary. No raw HTML is stored; body text is
+whitespace-normalized and length-capped (`max_text_length`), and evidence
+snippets are separately length-capped (`max_snippet_length`), so a single
+site cannot blow up output size.
+
+**How to run it locally:**
+```
+python3 scripts/enrichment/enrich_websites.py \
+  --master-json data/master/master.json \
+  --out-dir data/enrichment \
+  [--config path/to/config.json] [--max-pages 5] [--limit 50]
+```
+This never mutates `data/master/` -- it is a read-only pass over the
+master store -- and `data/enrichment/` is gitignored the same way
+`data/master/`, `data/google-maps/`, and `data/icp/` are, since it is
+fully regenerable from the master store at any time.
+
+**GitHub Actions:** this layer is written to be GitHub-Actions-compatible
+(pure Python + Scrapling's plain HTTP fetcher, no browser/headless-Chrome
+use, no paid API keys required) but **no production workflow has been added
+for it yet** -- it currently runs locally/on-demand only via the CLI
+above -- **production crawling is not enabled yet**. Its test suite
+(`tests/test_enrich_websites.py`, with HTML fixtures under
+`tests/fixtures/website_enrichment/`) mocks the network fetch only: fixture
+HTML is fed through Scrapling's real parser, so no test makes a real
+network call.
+
+**This layer does not make final ICP decisions.** It stops at collecting
+and structuring factual website evidence. A future, separate qualification
+layer is expected to consume `data/enrichment/website_enrichment.json`
+(alongside `data/icp/icp_qualified.json`) to produce a final,
+confidence-upgraded ICP result -- that layer is not built in this repo yet.
+
 **This is not a transactional database.** GitHub Actions cache and
 artifacts provide no locking: two workflow runs updating the master store
 at the same time can still race each other. The workflow sets
