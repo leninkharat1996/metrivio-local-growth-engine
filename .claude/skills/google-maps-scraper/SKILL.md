@@ -294,11 +294,10 @@ count do not grow.
 `data/master/` via `actions/cache` between runs (so the store accumulates
 run-over-run without committing anything), and always uploads
 `google-maps-master-store-<run_id>` (`master.csv`, `master.json`,
-`discovery_history.csv`) as a workflow artifact. `update_master.py` also
-writes `data/master/identity_conflicts.csv`, but the workflow's artifact
-upload step is unchanged as part of this fix, so check that file locally
-(or extend the upload step separately) if you need to review conflicts
-from a CI run.
+`discovery_history.csv`, `identity_conflicts.csv`) as a workflow artifact.
+`identity_conflicts.csv` is empty in the normal (no-conflict) case, which
+is fine — the upload step uses `if-no-files-found: warn`, so a run with no
+conflicts still succeeds.
 
 **Why lead data is never committed:** `data/master/*` is gitignored (only
 `data/master/.gitkeep` is tracked), matching `data/google-maps/`. The
@@ -307,9 +306,9 @@ to GitHub's cache eviction policy, ~7 days unused / 10GB per repo) — the
 authoritative snapshot for any given run is always the uploaded
 `google-maps-master-store-<run_id>` artifact. If you need guaranteed
 long-term continuity, download the latest `master.csv`/`master.json`/
-`discovery_history.csv` from that artifact into `data/master/` before the
-next run (so `update_master.py` resumes from it), or maintain the store
-outside CI.
+`discovery_history.csv`/`identity_conflicts.csv` from that artifact into
+`data/master/` before the next run (so `update_master.py` resumes from
+it), or maintain the store outside CI.
 
 ## Explicitly out of scope for this skill
 

@@ -230,6 +230,7 @@ jobs:
             data/master/master.csv
             data/master/master.json
             data/master/discovery_history.csv
+            data/master/identity_conflicts.csv
           if-no-files-found: warn
           retention-days: 90
 

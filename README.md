@@ -107,7 +107,7 @@ Reprocessing the same clean dataset is idempotent (no duplicate records or
 history events).
 
 The `Google Maps Scraper` workflow runs this automatically after each
-scrape and uploads `google-maps-master-store-<run_id>` (all three files) as
+scrape and uploads `google-maps-master-store-<run_id>` (all four files) as
 a workflow artifact. It also best-effort persists `data/master/` between
 runs via `actions/cache` so the store can accumulate over time without ever
 committing lead data to git — `data/master/*` is gitignored just like
