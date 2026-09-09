@@ -1,0 +1,210 @@
+{
+  "$schema": "https://metrivio.local/icp_rules.schema.json",
+  "description": "Deterministic ICP (Ideal Customer Profile) qualification rules for the master prospect store. Pure rule-based text matching against fields that genuinely exist in data/master/master.json -- no AI/LLM calls, no enrichment, no invented fields (no employee count, revenue, or capacity data unless it is already present on the record).",
+  "version": 1,
+
+  "fields_considered": [
+    "business_name",
+    "category",
+    "website",
+    "address",
+    "city",
+    "state",
+    "country",
+    "phone",
+    "rating",
+    "review_count"
+  ],
+
+  "text_fields_matched": [
+    "business_name",
+    "category"
+  ],
+
+  "tiers": {
+    "A_PLUS": {"min_score": 85, "label": "A+"},
+    "A": {"min_score": 65, "label": "A"},
+    "B": {"min_score": 40, "label": "B"},
+    "C": {"min_score": 15, "label": "C"},
+    "D": {"min_score": -1000000, "label": "D"}
+  },
+
+  "base_score": 30,
+
+  "hard_exclusions": {
+    "description": "Any single match forces tier D regardless of positive signals. Matched case-insensitively against business_name + category text.",
+    "business_type_keywords": [
+      "distributor",
+      "distribution",
+      "manufacturer",
+      "manufacturing",
+      "wholesale",
+      "wholesaler",
+      "supply co",
+      "supply company",
+      "supply store",
+      "hvac supply",
+      "parts store",
+      "parts supply",
+      "training school",
+      "trade school",
+      "vocational school",
+      "technical college",
+      "certification school",
+      "staffing agency",
+      "recruiter",
+      "recruiting",
+      "employment agency",
+      "headhunter",
+      "government",
+      "city of ",
+      "county of ",
+      "department of",
+      "municipal",
+      "federal"
+    ],
+    "single_trade_only_keywords": {
+      "description": "Business names/categories indicating a single non-HVAC trade with no HVAC signal present are excluded -- these are not HVAC contractors at all.",
+      "plumbing_only": ["plumbing", "plumber"],
+      "electrical_only": ["electrician", "electrical contractor", "electric company"],
+      "handyman_only": ["handyman", "handy man", "handy-man"]
+    },
+    "hvac_rescue_keywords": [
+      "hvac",
+      "heating and air",
+      "heating & air",
+      "heating cooling",
+      "heating and cooling",
+      "air conditioning",
+      "mechanical contractor",
+      "climate control",
+      "refrigeration"
+    ],
+    "non_us_country_allowlist": [
+      "usa",
+      "us",
+      "united states",
+      "united states of america",
+      ""
+    ]
+  },
+
+  "residential_only_exclusion": {
+    "description": "Residential-only HVAC (no commercial signal anywhere in name/category) is excluded to tier D. Mixed residential+commercial is NOT excluded and scores normally.",
+    "residential_keywords": [
+      "residential",
+      "home services",
+      "home comfort",
+      "house calls"
+    ],
+    "commercial_rescue_keywords": [
+      "commercial",
+      "industrial",
+      "restaurant",
+      "retail",
+      "office building",
+      "multifamily",
+      "multi-family",
+      "property management",
+      "facilities",
+      "facility",
+      "warehouse",
+      "hospitality",
+      "hotel",
+      "medical building",
+      "healthcare facility",
+      "commercial & residential",
+      "commercial and residential"
+    ]
+  },
+
+  "strong_commercial_service_signals": {
+    "description": "Keywords in business_name/category indicating the business itself is a commercial-focused HVAC/mechanical service provider. Additive points, matched independently (a record may match several).",
+    "points_each": 15,
+    "max_points": 45,
+    "keywords": [
+      "commercial hvac",
+      "commercial mechanical",
+      "industrial hvac",
+      "commercial refrigeration",
+      "commercial air conditioning",
+      "mechanical contractor",
+      "mechanical contractors",
+      "commercial heating",
+      "commercial cooling",
+      "building automation",
+      "energy management",
+      "chiller",
+      "rooftop unit",
+      "boiler service"
+    ]
+  },
+
+  "commercial_customer_vertical_signals": {
+    "description": "Keywords indicating the business serves commercial verticals (customer-side signal, distinct from the provider being commercial-branded). Additive points.",
+    "points_each": 8,
+    "max_points": 24,
+    "keywords": [
+      "restaurant",
+      "retail",
+      "office",
+      "multifamily",
+      "multi-family",
+      "property management",
+      "facilities",
+      "facility maintenance",
+      "warehouse",
+      "hospitality",
+      "hotel",
+      "healthcare",
+      "medical facility",
+      "school district",
+      "church",
+      "manufacturing facility",
+      "data center"
+    ]
+  },
+
+  "general_hvac_signal": {
+    "description": "Baseline recognition that the record is an HVAC/mechanical business at all (before commercial/residential qualifiers). Applied once.",
+    "points": 10,
+    "keywords": [
+      "hvac",
+      "heating and air",
+      "heating & air",
+      "heating cooling",
+      "heating and cooling",
+      "air conditioning",
+      "climate control",
+      "refrigeration",
+      "mechanical"
+    ]
+  },
+
+  "bonus_signals": {
+    "description": "Secondary evidence-based bonuses. Every check only fires when the underlying field is actually populated on the record -- never fabricated.",
+    "has_website": {"points": 8, "description": "Website present -- proxy for an established, findable business."},
+    "rating_at_least": {"threshold": 4.0, "points": 5, "description": "Google rating >= 4.0, only scored when rating is present."},
+    "review_count_at_least": {"threshold": 10, "points": 5, "description": "Review count >= 10, only scored when review_count is present."},
+    "review_count_at_least_high": {"threshold": 50, "points": 5, "description": "Additional bonus for review_count >= 50 (stacks with the >=10 bonus), only scored when present."},
+    "employee_count_present": {
+      "description": "Employee/size data is NEVER required and NEVER fabricated. If a future master record happens to carry an 'employee_count' or 'employees' field (not produced by the current collection pipeline), it is used only as a bonus, never as a qualification requirement.",
+      "field_names": ["employee_count", "employees", "company_size"],
+      "small_min": 5,
+      "mid_min": 20,
+      "points_small": 3,
+      "points_mid": 8
+    }
+  },
+
+  "insufficient_evidence_penalty": {
+    "description": "Records with almost no signal at all (no HVAC-relevant category text, no website, no rating/review data) are capped so they cannot reach A/A+ purely on the base score.",
+    "cap_score_when_no_positive_signals": 34
+  },
+
+  "notes": [
+    "Scoring is purely additive/subtractive over base_score using the sections above; no field is invented that isn't already in data/master/master.json.",
+    "Hard exclusions and the residential-only exclusion both force tier D by setting an icp_excluded flag that overrides the numeric tier lookup, but the numeric score is still computed and reported for transparency.",
+    "All keyword matching is case-insensitive substring matching over business_name and category text -- deterministic, no fuzzy/AI matching."
+  ]
+}

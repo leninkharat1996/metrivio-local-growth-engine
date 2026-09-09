@@ -12,6 +12,11 @@ data/master/*
 
 queries.txt
 
+# Generated ICP qualification output - deterministic derived data, never
+# committed. Regenerate any time with scripts/icp/qualify.py.
+data/icp/*
+!data/icp/.gitkeep
+
 # Python
 __pycache__/
 *.pyc

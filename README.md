@@ -135,6 +135,83 @@ workflow **fails outright** rather than silently falling back to an empty
 store — an empty master store is only ever used when no prior artifact
 genuinely exists.
 
+## ICP Qualification Layer
+
+A deterministic, explainable filtering layer on top of the master prospect
+store: `scripts/icp/qualify.py` reads `data/master/master.json` and scores
+every record against the rules in `config/icp_rules.json`, producing a
+tiered A+/A/B/C/D qualification with a transparent, human-readable score
+breakdown.
+
+**What it is not:** this is pure rule-based Python — no AI/LLM calls, no
+paid APIs, no web scraping, no enrichment (email finding, LinkedIn
+scraping, CRM sync) and no outreach of any kind happen in this layer. It
+only reads fields that already exist on a master record.
+
+**ICP definition (who this engine looks for):** commercial and industrial
+HVAC/mechanical service providers based in the US — businesses whose name
+or category signals commercial-focused HVAC work (e.g. "commercial HVAC",
+"industrial HVAC", "mechanical contractor", "commercial refrigeration") or
+that serve commercial customer verticals (restaurants, retail, offices,
+multifamily/property management, warehouses, hospitality, healthcare
+facilities, etc). Residential-only HVAC businesses are excluded; a
+business that serves both residential and commercial customers is **not**
+auto-rejected and is scored normally, since mixed-book HVAC shops are
+still viable commercial prospects.
+
+**Hard exclusions (force Tier D regardless of any positive signal):**
+distributor / manufacturer / wholesaler / supply store, training or trade
+school, staffing/recruiting agency, government entity, a business that is
+plumbing-only or electrical-only or handyman-only with no HVAC signal
+present, a business outside the US, and residential-only HVAC (no
+commercial signal anywhere in its name/category).
+
+**How scoring works:** every record starts from a base score and gains
+points additively for positive signals — a general HVAC/mechanical
+keyword match, strong commercial-service-provider keywords (capped),
+commercial customer/vertical keywords (capped), having a website on file,
+a Google rating ≥ 4.0, and review-count thresholds. Employee/company-size
+data is used **only** as a bonus when a record happens to carry it — it is
+never required and never fabricated, since the current collection
+pipeline does not produce it. A record with no positive signal at all
+(no HVAC-relevant text, no website, no rating/review data) is capped so it
+cannot reach tier A/A+ on the base score alone. The full list of matched
+signals is included in `icp_reasons` on every record; any hard exclusion
+that applied is listed in `icp_exclusions`. All rules, keyword lists, and
+point values live in `config/icp_rules.json`, separate from the scoring
+logic in `scripts/icp/qualify.py`, so the ICP definition can be tuned
+without touching code.
+
+**Tiers:** A+ (85+) and A (65+) are strong commercial-fit prospects; B
+(40+) is a plausible fit worth a manual look; C (15+) is weak/uncertain
+evidence; D is either a low score or a hard exclusion.
+
+**Determinism:** the same master record always produces the same score,
+tier, reasons, and exclusions — matching normalize.py/update_master.py's
+existing no-AI, no-fuzzy-matching philosophy. The only non-deterministic
+field is `icp_evaluated_at` (current UTC time by default); pass
+`--evaluated-at` to pin it for reproducible output.
+
+**How to run it:**
+```
+python3 scripts/icp/qualify.py \
+  --master-json data/master/master.json \
+  --rules config/icp_rules.json \
+  --out-dir data/icp
+```
+Output is written to `data/icp/icp_qualified.json` and `.csv`
+(`master_id`, `business_name`, `website`, `phone`, `address`, `city`,
+`state`, `country`, `rating`, `review_count`, `icp_tier`, `icp_score`,
+`icp_reasons`, `icp_exclusions`, `icp_evaluated_at`). This never mutates
+`data/master/` — it is a read-only pass over the master store — and
+`data/icp/` is gitignored the same way `data/master/` and
+`data/google-maps/` are, since it is fully regenerable from the master
+store at any time.
+
+This layer intentionally stops at a qualification tier and score — no
+enrichment, no contact discovery, no CRM sync, and no outreach happen
+here or anywhere else in this repo yet.
+
 **This is not a transactional database.** GitHub Actions cache and
 artifacts provide no locking: two workflow runs updating the master store
 at the same time can still race each other. The workflow sets
