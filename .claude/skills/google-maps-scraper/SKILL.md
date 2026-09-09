@@ -289,26 +289,58 @@ python3 scripts/google_maps_scraper/update_master.py \
 same clean dataset is idempotent: master record count and history event
 count do not grow.
 
-**In the workflow:** after normalize/manifest, the workflow runs
-`update_master.py` on the run's clean JSON files, best-effort restores/saves
-`data/master/` via `actions/cache` between runs (so the store accumulates
-run-over-run without committing anything), and always uploads
+**In the workflow:** after normalize/manifest, the workflow restores
+`data/master/` from `actions/cache` (best-effort), and — only if that
+didn't actually populate `data/master/master.csv` — falls back to
+downloading the `google-maps-master-store-*` artifact from the most recent
+**successful** `google-maps-scraper.yml` run before running
+`update_master.py` on the current run's clean JSON files. It then
+saves the resulting store back to the cache and always uploads
 `google-maps-master-store-<run_id>` (`master.csv`, `master.json`,
 `discovery_history.csv`, `identity_conflicts.csv`) as a workflow artifact.
 `identity_conflicts.csv` is empty in the normal (no-conflict) case, which
 is fine — the upload step uses `if-no-files-found: warn`, so a run with no
 conflicts still succeeds.
 
+**Cache-eviction fallback (Step 6D):** `actions/cache` is best-effort and
+can be evicted or race with a concurrent run at any time; the workflow
+never silently starts from an empty master store just because the cache
+missed. `scripts/google_maps_scraper/master_store_source.py` implements
+the (pure, unit-tested) decision logic:
+- `select_master_store_source(cache_restored, artifact_found)` picks
+  `cache` / `artifact` / `empty`, in that priority order.
+- `find_latest_master_store_artifact(runs)` deterministically picks the
+  most recent successful run (of this workflow only) that has a
+  `google-maps-master-store-*` artifact — never an arbitrary/failed run
+  or another workflow's artifact.
+The workflow logs which source it used every run (`MASTER_STORE_SOURCE=
+cache|artifact|empty`, the artifact case also logging the source run id).
+If the artifact lookup/download itself fails unexpectedly (API error,
+found-but-undownloadable artifact), the step exits non-zero and the job
+fails — it does not fall through to `empty`. `empty` is only reached when
+the search genuinely finds no successful run with a master-store artifact
+(the first-ever run), and the log says so explicitly.
+
+**Concurrency:** the workflow sets a top-level
+`concurrency: {group: google-maps-master-store, cancel-in-progress: false}`,
+so GitHub queues overlapping runs of this workflow instead of letting two
+writers touch `data/master/` at once. This is GitHub-native queuing, not a
+transactional lock — it doesn't protect against every conceivable race
+(e.g. runs outside this workflow, or a manual cache/artifact operation),
+and this codebase doesn't claim it does.
+
 **Why lead data is never committed:** `data/master/*` is gitignored (only
-`data/master/.gitkeep` is tracked), matching `data/google-maps/`. The
-GitHub Actions cache used for cross-run persistence is best-effort (subject
-to GitHub's cache eviction policy, ~7 days unused / 10GB per repo) — the
-authoritative snapshot for any given run is always the uploaded
-`google-maps-master-store-<run_id>` artifact. If you need guaranteed
-long-term continuity, download the latest `master.csv`/`master.json`/
-`discovery_history.csv`/`identity_conflicts.csv` from that artifact into
-`data/master/` before the next run (so `update_master.py` resumes from
-it), or maintain the store outside CI.
+`data/master/.gitkeep` is tracked), matching `data/google-maps/`. Neither
+the `actions/cache` entry nor the workflow artifact is permanent: the
+cache is subject to GitHub's eviction policy (~7 days unused / 10GB per
+repo), and the uploaded artifact has its own retention window
+(`retention-days: 90` here, plus GitHub's own account/plan-level caps) —
+artifact-backed persistence is durable relative to the cache, it is not
+indefinite. If you need guaranteed long-term continuity beyond that
+window, download the latest `master.csv`/`master.json`/
+`discovery_history.csv`/`identity_conflicts.csv` from the most recent
+artifact into `data/master/` before it expires, or maintain the store
+outside CI.
 
 ## Explicitly out of scope for this skill
 

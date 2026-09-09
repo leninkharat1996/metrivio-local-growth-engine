@@ -111,6 +111,39 @@ scrape and uploads `google-maps-master-store-<run_id>` (all four files) as
 a workflow artifact. It also best-effort persists `data/master/` between
 runs via `actions/cache` so the store can accumulate over time without ever
 committing lead data to git — `data/master/*` is gitignored just like
-`data/google-maps/`. The cache is not a durability guarantee (GitHub evicts
-unused caches); the uploaded artifact from each run is the authoritative
-snapshot.
+`data/google-maps/`.
+
+**Cache eviction fallback:** `actions/cache` is best-effort — GitHub can
+evict a cache entry at any time (LRU eviction, the ~7-day-unused policy,
+the ~10GB-per-repo cap, or a race with a concurrent run). The workflow
+does not just start from an empty master store when the cache misses:
+before running `update_master.py`, it checks whether `data/master/`
+actually restored, and if not, looks up the most recent **successful**
+`google-maps-scraper.yml` run that uploaded a `google-maps-master-store-*`
+artifact and downloads *that* into `data/master/` first. Every run logs
+which source it used:
+- `MASTER_STORE_SOURCE=cache` — cache restore worked.
+- `MASTER_STORE_SOURCE=artifact (run <id>, artifact <name>)` — cache
+  missed, restored from that prior run's artifact instead.
+- `MASTER_STORE_SOURCE=empty` — no cache hit *and* no previous successful
+  run has ever uploaded a master-store artifact; this is treated as the
+  first-ever run and is logged as such.
+
+If the fallback lookup itself fails unexpectedly (GitHub API/network
+error, or an artifact is found but fails to download/extract), the
+workflow **fails outright** rather than silently falling back to an empty
+store — an empty master store is only ever used when no prior artifact
+genuinely exists.
+
+**This is not a transactional database.** GitHub Actions cache and
+artifacts provide no locking: two workflow runs updating the master store
+at the same time can still race each other. The workflow sets
+`concurrency: {group: google-maps-master-store, cancel-in-progress: false}`
+at the workflow level, which makes GitHub queue overlapping runs of this
+workflow one at a time instead of letting two writers touch
+`data/master/` concurrently — this is GitHub-native queuing, not a
+guarantee against every possible race (e.g. a run started outside this
+workflow's queue, or a manual artifact download/upload done by hand).
+Artifacts also have a finite retention window (`retention-days: 90` here,
+and GitHub enforces its own account/plan-level caps) — they are durable
+relative to the cache, not permanent.
