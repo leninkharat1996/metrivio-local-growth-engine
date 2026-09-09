@@ -23,6 +23,12 @@ data/icp/*
 data/enrichment/*
 !data/enrichment/.gitkeep
 
+# Generated Final ICP qualification output (Step 10) - deterministic
+# derived data, never committed. Regenerate any time with
+# scripts/final_icp/qualify_final.py.
+data/final_icp/*
+!data/final_icp/.gitkeep
+
 # Python
 __pycache__/
 *.pyc

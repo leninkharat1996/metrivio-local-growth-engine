@@ -1,0 +1,120 @@
+{
+  "$schema": "https://metrivio.local/final_icp_rules.schema.json",
+  "concept": "Final ICP Qualification (Step 10)",
+  "description": "Deterministic FINAL ICP qualification rules. Consumes the preliminary ICP output (data/icp/icp_qualified.json) and the website enrichment evidence output (data/enrichment/website_enrichment.json), joined by master_id. Status is decided entirely by evidence-gate rules (geography, hard exclusions, residential-only, direct-service evidence thresholds) BEFORE any score/tier is computed -- score/tier can never promote a record past what the status rules already decided. No AI/LLM, no network calls, no paid APIs.",
+  "version": 1,
+
+  "hvac_direct_categories": [
+    "commercial_hvac",
+    "industrial_hvac",
+    "commercial_mechanical",
+    "commercial_refrigeration",
+    "commercial_air_conditioning",
+    "commercial_heating",
+    "commercial_cooling",
+    "hvac_controls",
+    "building_automation",
+    "energy_management",
+    "chiller",
+    "rtu_rooftop",
+    "boiler"
+  ],
+
+  "bucket2_service_categories": [
+    "preventive_maintenance",
+    "maintenance_contract",
+    "service_contract",
+    "mechanical_services",
+    "design_build",
+    "facility_services"
+  ],
+
+  "vertical_category": "commercial_vertical",
+
+  "usable_website_statuses": ["success", "partial"],
+
+  "non_us_country_allowlist": [
+    "usa",
+    "us",
+    "united states",
+    "united states of america",
+    ""
+  ],
+
+  "us_state_codes": [
+    "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA",
+    "HI", "ID", "IL", "IN", "IA", "KS", "KY", "LA", "ME", "MD",
+    "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ",
+    "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "RI", "SC",
+    "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY",
+    "DC"
+  ],
+
+  "website_hard_exclusion_signals": {
+    "description": "New, website-evidence-based hard exclusions beyond what preliminary ICP already catches from name/category text alone. A record is excluded if its homepage title/description matches a manufacturer/distributor/supply/parts-counter/association/directory/media pattern AND it has zero direct_service matches in hvac_direct_categories or bucket2_service_categories (i.e. all commercial-category evidence, if any, is incidental).",
+    "supply_manufacturer_keywords": [
+      "supply", "supplies", "wholesale", "wholesaler", "distributor",
+      "distribution", "manufacturer", "manufacturing", "parts and equipment",
+      "parts counter", "parts department", "equipment dealer"
+    ],
+    "association_directory_media_keywords": [
+      "association", "directory", "trade magazine", "industry news",
+      "blog", "news site"
+    ]
+  },
+
+  "residential_only_categories": ["residential", "residential_only_indicator"],
+
+  "score": {
+    "bucket1_hvac_direct": {
+      "points_per_category": 9,
+      "max_points": 45,
+      "table": {"0": 0, "1": 9, "2": 18, "3": 27, "4": 36, "5+": 45}
+    },
+    "bucket2_service": {
+      "max_points": 25,
+      "table": {"0": 0, "1": 8, "2": 17, "3+": 25}
+    },
+    "bucket3_supporting": {
+      "max_points": 20,
+      "vertical_breadth": {"points_per_vertical": 4, "max_points": 12},
+      "preliminary_corroboration": {"high": 6, "medium": 3, "low": 0, "max_points": 6},
+      "rating_reviews": {
+        "rating_at_least_4": 1,
+        "review_count_at_least_10": 1,
+        "review_count_at_least_50": 2,
+        "max_points": 2,
+        "description": "review_count_at_least_50 REPLACES review_count_at_least_10's point, it does not stack -- total capped at 2."
+      }
+    },
+    "bucket4_modifiers": {
+      "employee_count": {
+        "field_names": ["employee_count", "employees", "company_size"],
+        "band_10_75": 5,
+        "band_76_250": 2
+      },
+      "residential_alongside_commercial": -3,
+      "website_status_penalty": {
+        "success": 0,
+        "partial": -5,
+        "fallback_preliminary_only": -8
+      },
+      "floor": 0
+    }
+  },
+
+  "tiers": {
+    "A_PLUS": {"min_score": 80, "label": "A+"},
+    "A": {"min_score": 60, "label": "A"},
+    "B": {"min_score": 40, "label": "B"},
+    "C": {"min_score": 15, "label": "C"},
+    "D": {"min_score": -1000000, "label": "D"}
+  },
+
+  "notes": [
+    "n_hvac == 0 can never produce final_icp_status='qualified' on any website-confirmed path, regardless of score, vertical breadth, rating, or review_count.",
+    "The website-unavailable fallback (preliminary_icp_only) is the ONLY qualification path that does not require hvac_direct_categories evidence, because no website evidence exists to evaluate.",
+    "Score and tier are computed strictly after status is finalized and never feed back into status.",
+    "Fallback-qualified records are capped at tier B."
+  ]
+}
