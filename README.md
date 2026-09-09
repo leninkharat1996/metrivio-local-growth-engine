@@ -67,3 +67,42 @@ automatically when asked to run a Google Maps prospecting search.
 
 This layer intentionally stops at clean Google Maps leads — no email
 finding, enrichment, LinkedIn scraping, CRM sync, scoring, or outreach.
+
+## Persistent Master Prospect Store
+
+The same business can be scraped repeatedly across different cities,
+keywords, and dates. `scripts/google_maps_scraper/update_master.py`
+deterministically upserts every run's clean output into a single,
+deduplicated master store so each business appears once, while a separate
+discovery-history log records every run/search that surfaced it.
+
+- `data/master/master.csv` / `master.json` — one row per unique business
+  (canonical schema + `master_id`, `first_seen_at`, `last_seen_at`,
+  `source_count`, `search_count`).
+- `data/master/discovery_history.csv` — one row per run/search that
+  discovered a business (`master_id`, `run_id`, `search_id`,
+  `search_keyword`, `search_location`, `source`, `first_discovered_at`).
+
+`master_id` is a deterministic hash of the business's most reliable
+identifier (normalized website domain, else normalized phone, else
+normalized name+address) — no fuzzy or AI matching — so it stays stable
+across runs, keywords, and cities. See the skill doc's "Persistent master
+prospect store" section for the full merge/conflict rules.
+
+Run it manually with:
+```
+python3 scripts/google_maps_scraper/update_master.py \
+  --clean-json "data/google-maps/<run_id>/*/clean/clean.json" \
+  --master-dir data/master
+```
+Reprocessing the same clean dataset is idempotent (no duplicate records or
+history events).
+
+The `Google Maps Scraper` workflow runs this automatically after each
+scrape and uploads `google-maps-master-store-<run_id>` (all three files) as
+a workflow artifact. It also best-effort persists `data/master/` between
+runs via `actions/cache` so the store can accumulate over time without ever
+committing lead data to git — `data/master/*` is gitignored just like
+`data/google-maps/`. The cache is not a durability guarantee (GitHub evicts
+unused caches); the uploaded artifact from each run is the authoritative
+snapshot.

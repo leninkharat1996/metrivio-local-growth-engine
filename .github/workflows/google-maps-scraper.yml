@@ -192,6 +192,47 @@ jobs:
           if-no-files-found: warn
           retention-days: 90
 
+      - name: Restore previous master snapshot from cache (best-effort)
+        if: always() && steps.manifest.outcome == 'success'
+        uses: actions/cache/restore@v4
+        with:
+          path: data/master
+          key: google-maps-master-store-${{ github.run_id }}
+          restore-keys: |
+            google-maps-master-store-
+
+      - name: Update master prospect store
+        if: always() && steps.manifest.outcome == 'success'
+        run: |
+          shopt -s nullglob
+          clean_json_files=("${{ steps.meta.outputs.run_dir }}"/*/clean/*.json)
+          if [ ${#clean_json_files[@]} -eq 0 ]; then
+            echo "No clean datasets produced this run; skipping master update."
+          else
+            python3 scripts/google_maps_scraper/update_master.py \
+              --master-dir data/master \
+              "${clean_json_files[@]/#/--clean-json=}"
+          fi
+
+      - name: Save master snapshot to cache (best-effort, for the next run)
+        if: always() && steps.manifest.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: data/master
+          key: google-maps-master-store-${{ github.run_id }}
+
+      - name: Upload master snapshot + discovery history
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: google-maps-master-store-${{ steps.meta.outputs.run_id }}
+          path: |
+            data/master/master.csv
+            data/master/master.json
+            data/master/discovery_history.csv
+          if-no-files-found: warn
+          retention-days: 90
+
       - name: Fail the workflow if the run wasn't fully successful
         if: always()
         run: |

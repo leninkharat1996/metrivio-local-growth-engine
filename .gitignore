@@ -5,6 +5,11 @@
 data/google-maps/*
 !data/google-maps/.gitkeep
 
+# Persistent cross-run master prospect store - generated lead data, never
+# committed. See data/master/README.md (tracked) for the schema.
+data/master/*
+!data/master/.gitkeep
+
 queries.txt
 
 # Python

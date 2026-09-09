@@ -201,6 +201,74 @@ order:
 When two records collide, the one with more complete contact info (has a
 phone or website) is kept.
 
+## Persistent master prospect store (cross-run deduplication)
+
+The same business often appears in multiple runs (different cities,
+keywords, depths, dates). `scripts/google_maps_scraper/update_master.py`
+upserts every run's clean output into a persistent, deduplicated master
+store so each business is represented once, while keeping full discovery
+history.
+
+**What it is:** two files under `data/master/` (not committed to git,
+see below):
+- `master.csv` / `master.json` — one row per unique business, in the
+  canonical `normalize.py` schema plus `master_id`, `first_seen_at`,
+  `last_seen_at`, `source_count`, `search_count`.
+- `discovery_history.csv` — one row per `(master_id, run_id, search_id)`
+  triple: `master_id, run_id, search_id, search_keyword, search_location,
+  source, first_discovered_at`. This is where you look up every run/search
+  that surfaced a given business; the master record itself stays compact.
+
+**How `master_id` is generated (deterministic, no fuzzy/AI matching):**
+reuses `normalize.dedup_key()`'s existing priority order — normalized
+website domain, else normalized phone, else normalized business name +
+address — and hashes it: `sha256(":".join(key)).hexdigest()[:16]`. Because
+the key never includes `run_id`/`search_id`/`scraped_at`, the same business
+gets the same `master_id` no matter which run, keyword, city, or date
+surfaced it.
+
+**Cross-run merge rule when a business reappears:**
+- Blank-fill only: a populated existing field is never overwritten by an
+  incoming blank value; a blank existing field is filled by an incoming
+  populated value.
+- For two differing non-empty values (e.g. rating changed), the
+  **existing (first-seen) value wins** — deterministic, not guessed.
+- `scraped_at`, `search_keyword`, `search_location`, `search_id`, `run_id`
+  are treated as "latest snapshot" provenance and are always refreshed to
+  the most recent occurrence; the full history of every occurrence lives in
+  `discovery_history.csv`, not in the master record.
+- `first_seen_at`/`last_seen_at` track the earliest/latest `scraped_at`
+  seen for that business. `source_count`/`search_count` count distinct
+  `source`/`search_id` values from history.
+
+**How to update the master store:**
+```
+python3 scripts/google_maps_scraper/update_master.py \
+  --clean-json "data/google-maps/<run_id>/*/clean/clean.json" \
+  --master-dir data/master
+```
+`--clean-json` accepts a glob and may be repeated. Reprocessing the exact
+same clean dataset is idempotent: master record count and history event
+count do not grow.
+
+**In the workflow:** after normalize/manifest, the workflow runs
+`update_master.py` on the run's clean JSON files, best-effort restores/saves
+`data/master/` via `actions/cache` between runs (so the store accumulates
+run-over-run without committing anything), and always uploads
+`google-maps-master-store-<run_id>` (`master.csv`, `master.json`,
+`discovery_history.csv`) as a workflow artifact.
+
+**Why lead data is never committed:** `data/master/*` is gitignored (only
+`data/master/.gitkeep` is tracked), matching `data/google-maps/`. The
+GitHub Actions cache used for cross-run persistence is best-effort (subject
+to GitHub's cache eviction policy, ~7 days unused / 10GB per repo) — the
+authoritative snapshot for any given run is always the uploaded
+`google-maps-master-store-<run_id>` artifact. If you need guaranteed
+long-term continuity, download the latest `master.csv`/`master.json`/
+`discovery_history.csv` from that artifact into `data/master/` before the
+next run (so `update_master.py` resumes from it), or maintain the store
+outside CI.
+
 ## Explicitly out of scope for this skill
 
 Do not perform email finding/verification, LinkedIn scraping, enrichment,
