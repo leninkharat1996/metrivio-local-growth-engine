@@ -67,3 +67,83 @@ automatically when asked to run a Google Maps prospecting search.
 
 This layer intentionally stops at clean Google Maps leads — no email
 finding, enrichment, LinkedIn scraping, CRM sync, scoring, or outreach.
+
+## Persistent Master Prospect Store
+
+The same business can be scraped repeatedly across different cities,
+keywords, and dates. `scripts/google_maps_scraper/update_master.py`
+deterministically upserts every run's clean output into a single,
+deduplicated master store so each business appears once, while a separate
+discovery-history log records every run/search that surfaced it.
+
+- `data/master/master.csv` / `master.json` — one row per unique business
+  (canonical schema + `master_id`, `first_seen_at`, `last_seen_at`,
+  `source_count`, `search_count`).
+- `data/master/discovery_history.csv` — one row per run/search that
+  discovered a business (`master_id`, `run_id`, `search_id`,
+  `search_keyword`, `search_location`, `source`, `first_discovered_at`).
+- `data/master/identity_conflicts.csv` — one row per detected identity
+  collision (see below), for human review; normally empty.
+
+Every incoming lead is resolved against a deterministic identity index
+(`identity key -> master_id`) rebuilt from the existing master store —
+normalized website domain, else normalized phone, else normalized
+name+address, no fuzzy or AI matching — so a business keeps the same
+`master_id` across runs, keywords, and cities even when its website or
+phone is missing from a later scrape. Genuinely conflicting identifiers
+(e.g. a lead whose website matches one master but whose phone matches a
+different master) are never silently merged; they're resolved
+deterministically and logged to `identity_conflicts.csv`. See the skill
+doc's "Persistent master prospect store" section for the full
+resolution/merge/conflict rules.
+
+Run it manually with:
+```
+python3 scripts/google_maps_scraper/update_master.py \
+  --clean-json "data/google-maps/<run_id>/*/clean/clean.json" \
+  --master-dir data/master
+```
+Reprocessing the same clean dataset is idempotent (no duplicate records or
+history events).
+
+The `Google Maps Scraper` workflow runs this automatically after each
+scrape and uploads `google-maps-master-store-<run_id>` (all four files) as
+a workflow artifact. It also best-effort persists `data/master/` between
+runs via `actions/cache` so the store can accumulate over time without ever
+committing lead data to git — `data/master/*` is gitignored just like
+`data/google-maps/`.
+
+**Cache eviction fallback:** `actions/cache` is best-effort — GitHub can
+evict a cache entry at any time (LRU eviction, the ~7-day-unused policy,
+the ~10GB-per-repo cap, or a race with a concurrent run). The workflow
+does not just start from an empty master store when the cache misses:
+before running `update_master.py`, it checks whether `data/master/`
+actually restored, and if not, looks up the most recent **successful**
+`google-maps-scraper.yml` run that uploaded a `google-maps-master-store-*`
+artifact and downloads *that* into `data/master/` first. Every run logs
+which source it used:
+- `MASTER_STORE_SOURCE=cache` — cache restore worked.
+- `MASTER_STORE_SOURCE=artifact (run <id>, artifact <name>)` — cache
+  missed, restored from that prior run's artifact instead.
+- `MASTER_STORE_SOURCE=empty` — no cache hit *and* no previous successful
+  run has ever uploaded a master-store artifact; this is treated as the
+  first-ever run and is logged as such.
+
+If the fallback lookup itself fails unexpectedly (GitHub API/network
+error, or an artifact is found but fails to download/extract), the
+workflow **fails outright** rather than silently falling back to an empty
+store — an empty master store is only ever used when no prior artifact
+genuinely exists.
+
+**This is not a transactional database.** GitHub Actions cache and
+artifacts provide no locking: two workflow runs updating the master store
+at the same time can still race each other. The workflow sets
+`concurrency: {group: google-maps-master-store, cancel-in-progress: false}`
+at the workflow level, which makes GitHub queue overlapping runs of this
+workflow one at a time instead of letting two writers touch
+`data/master/` concurrently — this is GitHub-native queuing, not a
+guarantee against every possible race (e.g. a run started outside this
+workflow's queue, or a manual artifact download/upload done by hand).
+Artifacts also have a finite retention window (`retention-days: 90` here,
+and GitHub enforces its own account/plan-level caps) — they are durable
+relative to the cache, not permanent.

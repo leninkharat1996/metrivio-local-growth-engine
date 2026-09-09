@@ -201,6 +201,147 @@ order:
 When two records collide, the one with more complete contact info (has a
 phone or website) is kept.
 
+## Persistent master prospect store (cross-run deduplication)
+
+The same business often appears in multiple runs (different cities,
+keywords, depths, dates). `scripts/google_maps_scraper/update_master.py`
+upserts every run's clean output into a persistent, deduplicated master
+store so each business is represented once, while keeping full discovery
+history.
+
+**What it is:** two files under `data/master/` (not committed to git,
+see below):
+- `master.csv` / `master.json` — one row per unique business, in the
+  canonical `normalize.py` schema plus `master_id`, `first_seen_at`,
+  `last_seen_at`, `source_count`, `search_count`.
+- `discovery_history.csv` — one row per `(master_id, run_id, search_id)`
+  triple: `master_id, run_id, search_id, search_keyword, search_location,
+  source, first_discovered_at`. This is where you look up every run/search
+  that surfaced a given business; the master record itself stays compact.
+- `identity_conflicts.csv` — one row per detected identity collision (see
+  below): `master_id, resolved_via_key, conflicting_master_ids,
+  business_name, run_id, search_id, detected_at`. Empty in the normal case;
+  non-empty rows need a human look, since they are never auto-merged.
+
+**How `master_id` is assigned and kept stable (deterministic, no
+fuzzy/AI matching):** `master_id` is assigned once per business and never
+recomputed from an incoming lead's own fields alone. Every incoming lead is
+resolved against a **deterministic identity index** (`identity key ->
+master_id`) rebuilt from the existing master store, using the same
+identifiers as `normalize.dedup_key()`/`normalize.match_keys()`, in
+priority order: normalized website domain > normalized phone > normalized
+business name + address.
+
+- If a key the lead carries already resolves to an existing master, the
+  lead attaches to that master — even if the *other* fields that could
+  have identified it are blank on this run. This is what keeps a business's
+  `master_id` stable when its website or phone disappears from a later
+  Google Maps scrape (previously this recomputed the id from whichever
+  fields were present on that run alone, which changed the id and created
+  a duplicate record).
+- If none of the lead's keys match anything in the index, it's a brand-new
+  business: its `master_id` is minted via
+  `sha256(":".join(dedup_key(lead))).hexdigest()[:16]`, using the same
+  priority order (domain > phone > name+address) so a business with no
+  website/phone still gets a stable id from name+address.
+- If a later scrape reveals a website or phone for a business that was
+  first seen with only a name+address key, that new key is added to the
+  index under the *existing* master_id (matched via name+address) rather
+  than minting a new record.
+- A present, higher-priority key (domain, or phone when domain is absent)
+  that is brand-new to the index is trusted on its own: a lower-priority
+  key incidentally matching a different, unrelated master (e.g. a shared
+  phone number) does not attach this lead to that master. name+address is
+  always checked as a last-resort corroboration.
+- If a lead's own keys point at two *different* existing masters (e.g. its
+  website matches master A but its phone matches master B), this is an
+  identity conflict: it is never silently merged. Resolution picks the
+  higher-priority key's master deterministically and the collision is
+  logged to `identity_conflicts.csv` for a human to review.
+
+Because resolution is always against the persisted store, not against
+`run_id`/`search_id`/`scraped_at` or the shape of a single incoming
+record, the same business gets the same `master_id` no matter which run,
+keyword, city, or date surfaced it, and no matter which of its identifying
+fields happened to be populated on that particular scrape.
+
+**Cross-run merge rule when a business reappears:**
+- Blank-fill only: a populated existing field is never overwritten by an
+  incoming blank value; a blank existing field is filled by an incoming
+  populated value.
+- For two differing non-empty values (e.g. rating changed), the
+  **existing (first-seen) value wins** — deterministic, not guessed.
+- `scraped_at`, `search_keyword`, `search_location`, `search_id`, `run_id`
+  are treated as "latest snapshot" provenance and are always refreshed to
+  the most recent occurrence; the full history of every occurrence lives in
+  `discovery_history.csv`, not in the master record.
+- `first_seen_at`/`last_seen_at` track the earliest/latest `scraped_at`
+  seen for that business. `source_count`/`search_count` count distinct
+  `source`/`search_id` values from history.
+
+**How to update the master store:**
+```
+python3 scripts/google_maps_scraper/update_master.py \
+  --clean-json "data/google-maps/<run_id>/*/clean/clean.json" \
+  --master-dir data/master
+```
+`--clean-json` accepts a glob and may be repeated. Reprocessing the exact
+same clean dataset is idempotent: master record count and history event
+count do not grow.
+
+**In the workflow:** after normalize/manifest, the workflow restores
+`data/master/` from `actions/cache` (best-effort), and — only if that
+didn't actually populate `data/master/master.csv` — falls back to
+downloading the `google-maps-master-store-*` artifact from the most recent
+**successful** `google-maps-scraper.yml` run before running
+`update_master.py` on the current run's clean JSON files. It then
+saves the resulting store back to the cache and always uploads
+`google-maps-master-store-<run_id>` (`master.csv`, `master.json`,
+`discovery_history.csv`, `identity_conflicts.csv`) as a workflow artifact.
+`identity_conflicts.csv` is empty in the normal (no-conflict) case, which
+is fine — the upload step uses `if-no-files-found: warn`, so a run with no
+conflicts still succeeds.
+
+**Cache-eviction fallback (Step 6D):** `actions/cache` is best-effort and
+can be evicted or race with a concurrent run at any time; the workflow
+never silently starts from an empty master store just because the cache
+missed. `scripts/google_maps_scraper/master_store_source.py` implements
+the (pure, unit-tested) decision logic:
+- `select_master_store_source(cache_restored, artifact_found)` picks
+  `cache` / `artifact` / `empty`, in that priority order.
+- `find_latest_master_store_artifact(runs)` deterministically picks the
+  most recent successful run (of this workflow only) that has a
+  `google-maps-master-store-*` artifact — never an arbitrary/failed run
+  or another workflow's artifact.
+The workflow logs which source it used every run (`MASTER_STORE_SOURCE=
+cache|artifact|empty`, the artifact case also logging the source run id).
+If the artifact lookup/download itself fails unexpectedly (API error,
+found-but-undownloadable artifact), the step exits non-zero and the job
+fails — it does not fall through to `empty`. `empty` is only reached when
+the search genuinely finds no successful run with a master-store artifact
+(the first-ever run), and the log says so explicitly.
+
+**Concurrency:** the workflow sets a top-level
+`concurrency: {group: google-maps-master-store, cancel-in-progress: false}`,
+so GitHub queues overlapping runs of this workflow instead of letting two
+writers touch `data/master/` at once. This is GitHub-native queuing, not a
+transactional lock — it doesn't protect against every conceivable race
+(e.g. runs outside this workflow, or a manual cache/artifact operation),
+and this codebase doesn't claim it does.
+
+**Why lead data is never committed:** `data/master/*` is gitignored (only
+`data/master/.gitkeep` is tracked), matching `data/google-maps/`. Neither
+the `actions/cache` entry nor the workflow artifact is permanent: the
+cache is subject to GitHub's eviction policy (~7 days unused / 10GB per
+repo), and the uploaded artifact has its own retention window
+(`retention-days: 90` here, plus GitHub's own account/plan-level caps) —
+artifact-backed persistence is durable relative to the cache, it is not
+indefinite. If you need guaranteed long-term continuity beyond that
+window, download the latest `master.csv`/`master.json`/
+`discovery_history.csv`/`identity_conflicts.csv` from the most recent
+artifact into `data/master/` before it expires, or maintain the store
+outside CI.
+
 ## Explicitly out of scope for this skill
 
 Do not perform email finding/verification, LinkedIn scraping, enrichment,

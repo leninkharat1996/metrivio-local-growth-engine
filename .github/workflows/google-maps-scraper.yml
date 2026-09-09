@@ -20,10 +20,28 @@ on:
 
 # This workflow runs entirely on GitHub-hosted runners. No local install,
 # no Docker Desktop, and no paid APIs are required.
+#
+# The persistent master store (data/master/) is best-effort cached between
+# runs and is NOT a transactional database: actions/cache can be evicted at
+# any time, and GitHub gives no locking across concurrent runs. The
+# `concurrency` block below serializes runs of this workflow (one writer to
+# the master store at a time) using GitHub's own queueing -- it does not by
+# itself guarantee the cache won't have been evicted, which is why the
+# "restore master store" step below also falls back to the most recent
+# successful run's uploaded artifact when the cache misses. See the
+# "Persistent Master Prospect Store" section of README.md for the full
+# persistence-source priority and its limits.
+concurrency:
+  group: google-maps-master-store
+  cancel-in-progress: false
+
 jobs:
   scrape:
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    permissions:
+      contents: read
+      actions: read
     steps:
       - name: Checkout metrivio-local-growth-engine
         uses: actions/checkout@v4
@@ -189,6 +207,127 @@ jobs:
         with:
           name: google-maps-manifest-${{ steps.meta.outputs.run_id }}
           path: ${{ steps.meta.outputs.run_dir }}/manifest.json
+          if-no-files-found: warn
+          retention-days: 90
+
+      - name: Restore master store from cache (best-effort)
+        if: always() && steps.manifest.outcome == 'success'
+        id: cache_restore
+        uses: actions/cache/restore@v4
+        with:
+          path: data/master
+          key: google-maps-master-store-${{ github.run_id }}
+          restore-keys: |
+            google-maps-master-store-
+
+      - name: Resolve master store source (cache, artifact fallback, or empty)
+        if: always() && steps.manifest.outcome == 'success'
+        id: master_source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # actions/cache's own `cache-hit` output is only true on an exact
+          # key match; our primary key includes github.run_id and is always
+          # unique, so a restore-keys prefix match (the common case) would
+          # be misreported as a miss. Check the actual files instead.
+          cache_restored=false
+          if [ -f data/master/master.csv ]; then
+            cache_restored=true
+          fi
+
+          artifact_found=false
+          artifact_run_id=""
+          artifact_name=""
+
+          if [ "${cache_restored}" = "false" ]; then
+            echo "Cache did not restore a master store; searching for the most recent"
+            echo "successful google-maps-scraper.yml run with a master-store artifact..."
+
+            run_ids=$(gh api "repos/${GH_REPO}/actions/workflows/google-maps-scraper.yml/runs?status=success&per_page=50" --jq '.workflow_runs[].id')
+
+            master_source_py="scripts/google_maps_scraper/master_store_source.py"
+            entries_file=$(mktemp)
+            echo "[]" > "${entries_file}"
+            for run_id in ${run_ids}; do
+              artifacts=$(gh api "repos/${GH_REPO}/actions/runs/${run_id}/artifacts?per_page=100" --jq '[.artifacts[] | {name: .name}]')
+              python3 "${master_source_py}" append-run "${entries_file}" "${run_id}" "${artifacts}"
+
+              # Runs are returned newest-first, so stop at the first run
+              # that already has a matching artifact -- it's the answer.
+              if python3 "${master_source_py}" has-master-artifact "${artifacts}"; then
+                break
+              fi
+            done
+
+            result=$(python3 "${master_source_py}" find-latest "${entries_file}")
+            rm -f "${entries_file}"
+
+            if [ -n "${result}" ]; then
+              artifact_found=true
+              artifact_run_id="${result%% *}"
+              artifact_name="${result#* }"
+            fi
+          fi
+
+          source=$(python3 scripts/google_maps_scraper/master_store_source.py select-source "${cache_restored}" "${artifact_found}")
+
+          case "${source}" in
+            cache)
+              echo "MASTER_STORE_SOURCE=cache"
+              ;;
+            artifact)
+              echo "Found master-store artifact '${artifact_name}' on run ${artifact_run_id}; downloading..."
+              mkdir -p data/master
+              gh run download "${artifact_run_id}" --repo "${GH_REPO}" --name "${artifact_name}" --dir data/master
+              if [ ! -f data/master/master.csv ]; then
+                echo "::error::Downloaded artifact '${artifact_name}' from run ${artifact_run_id} but data/master/master.csv is still missing; refusing to silently start empty."
+                exit 1
+              fi
+              echo "MASTER_STORE_SOURCE=artifact (run ${artifact_run_id}, artifact ${artifact_name})"
+              ;;
+            empty)
+              echo "No previous successful run with a master-store artifact was found."
+              echo "This is the first master-store run (or no prior artifact survived retention) -- initializing an empty master store."
+              echo "MASTER_STORE_SOURCE=empty"
+              ;;
+          esac
+
+          echo "source=${source}" >> "$GITHUB_OUTPUT"
+
+      - name: Update master prospect store
+        if: always() && steps.manifest.outcome == 'success'
+        run: |
+          echo "Master store source for this run: ${{ steps.master_source.outputs.source }}"
+          shopt -s nullglob
+          clean_json_files=("${{ steps.meta.outputs.run_dir }}"/*/clean/*.json)
+          if [ ${#clean_json_files[@]} -eq 0 ]; then
+            echo "No clean datasets produced this run; skipping master update."
+          else
+            python3 scripts/google_maps_scraper/update_master.py \
+              --master-dir data/master \
+              "${clean_json_files[@]/#/--clean-json=}"
+          fi
+
+      - name: Save master snapshot to cache (best-effort, for the next run)
+        if: always() && steps.manifest.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: data/master
+          key: google-maps-master-store-${{ github.run_id }}
+
+      - name: Upload master snapshot + discovery history
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: google-maps-master-store-${{ steps.meta.outputs.run_id }}
+          path: |
+            data/master/master.csv
+            data/master/master.json
+            data/master/discovery_history.csv
+            data/master/identity_conflicts.csv
           if-no-files-found: warn
           retention-days: 90
 
