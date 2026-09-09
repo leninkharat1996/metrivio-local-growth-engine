@@ -3,16 +3,17 @@ name: Google Maps Scraper
 on:
   workflow_dispatch:
     inputs:
-      keyword:
-        description: "Business category/keyword to search for"
+      search_plan:
+        description: >
+          One search per line: "keyword | location | depth". depth is
+          optional (falls back to default_depth). Blank lines and lines
+          starting with # are ignored. Example:
+          commercial HVAC contractors | Dallas, TX | 3
+          commercial HVAC companies | Dallas, TX | 3
         required: true
         type: string
-      location:
-        description: "City/state (or full location string) to search in"
-        required: true
-        type: string
-      depth:
-        description: "Scroll depth (more depth = more results per query, slower)"
+      default_depth:
+        description: "Depth used for a search line that omits its own depth"
         required: false
         type: string
         default: "5"
@@ -22,7 +23,7 @@ on:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 90
     steps:
       - name: Checkout metrivio-local-growth-engine
         uses: actions/checkout@v4
@@ -50,52 +51,153 @@ jobs:
       - name: Prepare run metadata
         id: meta
         run: |
-          slug=$(python3 scripts/google_maps_scraper/slugify_run.py "${{ inputs.keyword }}" "${{ inputs.location }}")
-          ts=$(date -u +%Y%m%d_%H%M%S)
-          echo "slug=${slug}" >> "$GITHUB_OUTPUT"
-          echo "ts=${ts}" >> "$GITHUB_OUTPUT"
+          run_id="run_${{ github.run_id }}_${{ github.run_attempt }}"
+          run_ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          echo "run_id=${run_id}" >> "$GITHUB_OUTPUT"
+          echo "run_ts=${run_ts}" >> "$GITHUB_OUTPUT"
+          echo "run_dir=data/google-maps/${run_id}" >> "$GITHUB_OUTPUT"
 
-      - name: Build query file
+      - name: Parse and validate search plan
+        id: plan
         run: |
-          mkdir -p data/google-maps/raw data/google-maps/clean
-          python3 scripts/google_maps_scraper/build_query.py \
-            --keyword "${{ inputs.keyword }}" \
-            --location "${{ inputs.location }}" \
-            --out queries.txt
-          cat queries.txt
+          mkdir -p "${{ steps.meta.outputs.run_dir }}"
+          cat > search_plan.txt <<'PLAN_EOF'
+          ${{ inputs.search_plan }}
+          PLAN_EOF
+          python3 scripts/google_maps_scraper/search_plan.py \
+            --plan-file search_plan.txt \
+            --default-depth "${{ inputs.default_depth }}" \
+            --out plan.json
+          valid_count=$(python3 -c "import json; print(sum(1 for e in json.load(open('plan.json')) if e['valid']))")
+          echo "valid_count=${valid_count}" >> "$GITHUB_OUTPUT"
+          echo "Parsed search plan:"
+          cat plan.json
 
-      - name: Run google-maps-scraper (Playwright/Chromium auto-installed on first run)
+      - name: Run each search in the plan (continues past individual failures)
+        id: run_searches
         run: |
-          RAW_CSV="data/google-maps/raw/${{ steps.meta.outputs.slug }}_${{ steps.meta.outputs.ts }}.csv"
-          ./google-maps-scraper/google-maps-scraper \
-            -input queries.txt \
-            -results "$RAW_CSV" \
-            -depth "${{ inputs.depth }}" \
-            -exit-on-inactivity 3m
-          echo "RAW_CSV=$RAW_CSV" >> "$GITHUB_ENV"
+          set +e
+          run_id="${{ steps.meta.outputs.run_id }}"
+          run_dir="${{ steps.meta.outputs.run_dir }}"
+          : > results.jsonl
 
-      - name: Normalize + deduplicate (deterministic, no AI usage)
+          count=$(python3 -c "import json; print(len(json.load(open('plan.json'))))")
+          for i in $(seq 0 $((count - 1))); do
+            entry=$(python3 -c "import json; print(json.dumps(json.load(open('plan.json'))[$i]))")
+            valid=$(echo "$entry" | python3 -c "import json,sys; print(json.load(sys.stdin)['valid'])")
+            if [ "$valid" != "True" ]; then
+              continue
+            fi
+
+            search_id=$(echo "$entry" | python3 -c "import json,sys; print(json.load(sys.stdin)['search_id'])")
+            keyword=$(echo "$entry" | python3 -c "import json,sys; print(json.load(sys.stdin)['keyword'])")
+            location=$(echo "$entry" | python3 -c "import json,sys; print(json.load(sys.stdin)['location'])")
+            depth=$(echo "$entry" | python3 -c "import json,sys; print(json.load(sys.stdin)['depth'])")
+
+            echo "::group::Search ${search_id} (${keyword} | ${location} | depth=${depth})"
+
+            search_dir="${run_dir}/${search_id}"
+            mkdir -p "${search_dir}/raw" "${search_dir}/clean"
+            raw_csv="${search_dir}/raw/raw.csv"
+            clean_prefix="${search_dir}/clean/clean"
+
+            python3 scripts/google_maps_scraper/build_query.py \
+              --keyword "${keyword}" --location "${location}" --out queries.txt \
+              && ./google-maps-scraper/google-maps-scraper \
+                   -input queries.txt \
+                   -results "${raw_csv}" \
+                   -depth "${depth}" \
+                   -exit-on-inactivity 3m
+
+            scrape_status=$?
+
+            if [ "${scrape_status}" -ne 0 ]; then
+              echo "::error::Search ${search_id} failed: scraper exited ${scrape_status}"
+              python3 -c "import json; print(json.dumps({'search_id': '${search_id}', 'status': 'failed', 'error': 'scraper exited with status ${scrape_status}'}))" >> results.jsonl
+              echo "::endgroup::"
+              continue
+            fi
+
+            stats_json=$(python3 scripts/google_maps_scraper/normalize.py \
+              --raw-csv "${raw_csv}" \
+              --category "${keyword}" \
+              --location "${location}" \
+              --out-prefix "${clean_prefix}" \
+              --search-id "${search_id}" \
+              --run-id "${run_id}")
+            normalize_status=$?
+
+            if [ "${normalize_status}" -ne 0 ]; then
+              echo "::error::Search ${search_id} failed: normalize exited ${normalize_status}"
+              python3 -c "import json; print(json.dumps({'search_id': '${search_id}', 'status': 'failed', 'error': 'normalize exited with status ${normalize_status}'}))" >> results.jsonl
+              echo "::endgroup::"
+              continue
+            fi
+
+            echo "${stats_json}" | python3 -c "import json, sys; stats = json.load(sys.stdin); print(json.dumps({'search_id': '${search_id}', 'status': 'success', 'stats': stats, 'artifacts': {'raw_csv': '${raw_csv}', 'clean_csv': stats['csv_path'], 'clean_json': stats['json_path']}}))" >> results.jsonl
+
+            echo "::endgroup::"
+          done
+          echo "Collected results:"
+          cat results.jsonl
+
+      - name: Build run manifest
+        id: manifest
+        if: always()
         run: |
-          CLEAN_PREFIX="data/google-maps/clean/${{ steps.meta.outputs.slug }}_${{ steps.meta.outputs.ts }}"
-          python3 scripts/google_maps_scraper/normalize.py \
-            --raw-csv "$RAW_CSV" \
-            --category "${{ inputs.keyword }}" \
-            --location "${{ inputs.location }}" \
-            --out-prefix "$CLEAN_PREFIX"
-          echo "CLEAN_PREFIX=$CLEAN_PREFIX" >> "$GITHUB_ENV"
+          set +e
+          python3 scripts/google_maps_scraper/build_manifest.py \
+            --run-id "${{ steps.meta.outputs.run_id }}" \
+            --plan-file plan.json \
+            --results-file results.jsonl \
+            --out "${{ steps.meta.outputs.run_dir }}/manifest.json"
+          manifest_status=$?
+          overall_status=$(python3 -c "import json; print(json.load(open('${{ steps.meta.outputs.run_dir }}/manifest.json'))['overall_status'])")
+          echo "overall_status=${overall_status}" >> "$GITHUB_OUTPUT"
+          echo "manifest_status=${manifest_status}" >> "$GITHUB_OUTPUT"
 
-      - name: Upload raw results artifact
+      - name: Upload raw CSV artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: google-maps-raw-${{ steps.meta.outputs.slug }}-${{ steps.meta.outputs.ts }}
-          path: ${{ env.RAW_CSV }}
+          name: google-maps-raw-${{ steps.meta.outputs.run_id }}
+          path: ${{ steps.meta.outputs.run_dir }}/*/raw/*.csv
+          if-no-files-found: warn
           retention-days: 30
 
-      - name: Upload clean leads artifact (CSV + JSON)
+      - name: Upload clean CSV artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: google-maps-clean-${{ steps.meta.outputs.slug }}-${{ steps.meta.outputs.ts }}
-          path: |
-            ${{ env.CLEAN_PREFIX }}.csv
-            ${{ env.CLEAN_PREFIX }}.json
+          name: google-maps-clean-csv-${{ steps.meta.outputs.run_id }}
+          path: ${{ steps.meta.outputs.run_dir }}/*/clean/*.csv
+          if-no-files-found: warn
           retention-days: 90
+
+      - name: Upload clean JSON artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: google-maps-clean-json-${{ steps.meta.outputs.run_id }}
+          path: ${{ steps.meta.outputs.run_dir }}/*/clean/*.json
+          if-no-files-found: warn
+          retention-days: 90
+
+      - name: Upload run manifest + statistics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: google-maps-manifest-${{ steps.meta.outputs.run_id }}
+          path: ${{ steps.meta.outputs.run_dir }}/manifest.json
+          if-no-files-found: warn
+          retention-days: 90
+
+      - name: Fail the workflow if the run wasn't fully successful
+        if: always()
+        run: |
+          status="${{ steps.manifest.outputs.overall_status }}"
+          echo "Overall run status: ${status}"
+          if [ "${status}" != "success" ]; then
+            echo "::error::Collection run status is '${status}' - see manifest artifact for per-search detail."
+            exit 1
+          fi

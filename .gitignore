@@ -1,10 +1,9 @@
 # Generated Google Maps scrape datasets - do not commit lead databases
-# by accident. Remove/override these rules explicitly if a specific
-# dataset should be kept in git history.
-data/google-maps/raw/*
-data/google-maps/clean/*
-!data/google-maps/raw/.gitkeep
-!data/google-maps/clean/.gitkeep
+# by accident. Each run writes to data/google-maps/<run_id>/<search_id>/
+# Remove/override these rules explicitly if a specific dataset should be
+# kept in git history.
+data/google-maps/*
+!data/google-maps/.gitkeep
 
 queries.txt
 

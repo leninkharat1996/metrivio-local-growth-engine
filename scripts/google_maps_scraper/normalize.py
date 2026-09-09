@@ -38,6 +38,10 @@ CANONICAL_FIELDS = [
     "longitude",
     "source",
     "scraped_at",
+    "search_keyword",
+    "search_location",
+    "search_id",
+    "run_id",
 ]
 
 # gosom/google-maps-scraper CSV/JSON header names we might see, mapped to our
@@ -166,7 +170,14 @@ def load_raw_rows(path: str) -> list[dict]:
         return list(csv.DictReader(f))
 
 
-def build_lead(raw_row: dict, category: str, location: str, scraped_at: str) -> dict | None:
+def build_lead(
+    raw_row: dict,
+    category: str,
+    location: str,
+    scraped_at: str,
+    search_id: str = "",
+    run_id: str = "",
+) -> dict | None:
     business_name = normalize_whitespace(_first_present(raw_row, RAW_FIELD_ALIASES["business_name"]))
     if not business_name:
         # Malformed record with no name is not a usable lead.
@@ -195,7 +206,10 @@ def build_lead(raw_row: dict, category: str, location: str, scraped_at: str) -> 
         "longitude": to_float(_first_present(raw_row, RAW_FIELD_ALIASES["longitude"])),
         "source": "google_maps_scraper",
         "scraped_at": scraped_at,
-        "_search_location": location,
+        "search_keyword": category,
+        "search_location": location,
+        "search_id": search_id,
+        "run_id": run_id,
     }
     return lead
 
@@ -237,11 +251,18 @@ def is_complete(lead: dict) -> bool:
     return bool(lead.get("phone") or lead.get("website"))
 
 
-def normalize_and_dedup(raw_rows: list[dict], category: str, location: str, scraped_at: str):
+def normalize_and_dedup(
+    raw_rows: list[dict],
+    category: str,
+    location: str,
+    scraped_at: str,
+    search_id: str = "",
+    run_id: str = "",
+):
     leads = []
     malformed = 0
     for raw_row in raw_rows:
-        lead = build_lead(raw_row, category, location, scraped_at)
+        lead = build_lead(raw_row, category, location, scraped_at, search_id, run_id)
         if lead is None:
             malformed += 1
             continue
@@ -334,15 +355,21 @@ def main(argv=None):
     parser.add_argument("--category", required=True, help="Business category/keyword searched")
     parser.add_argument("--location", required=True, help="City/state location searched")
     parser.add_argument("--out-prefix", required=True, help="Output path prefix (no extension)")
+    parser.add_argument("--search-id", default="", help="Deterministic id for this search (provenance)")
+    parser.add_argument("--run-id", default="", help="Deterministic id for the overall collection run")
     args = parser.parse_args(argv)
 
     scraped_at = datetime.now(timezone.utc).isoformat()
     raw_rows = load_raw_rows(args.raw_csv)
-    clean_leads, stats = normalize_and_dedup(raw_rows, args.category, args.location, scraped_at)
+    clean_leads, stats = normalize_and_dedup(
+        raw_rows, args.category, args.location, scraped_at, args.search_id, args.run_id
+    )
     csv_path, json_path = write_outputs(clean_leads, args.out_prefix)
 
     stats["csv_path"] = csv_path
     stats["json_path"] = json_path
+    stats["search_id"] = args.search_id
+    stats["run_id"] = args.run_id
     print(json.dumps(stats, indent=2))
     return stats
 

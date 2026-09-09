@@ -10,7 +10,9 @@ sys.path.insert(
     os.path.join(os.path.dirname(__file__), "..", "scripts", "google_maps_scraper"),
 )
 
+import build_manifest  # noqa: E402
 import normalize  # noqa: E402
+import search_plan  # noqa: E402
 
 
 class NormalizationTests(unittest.TestCase):
@@ -64,6 +66,10 @@ class DedupTests(unittest.TestCase):
             "longitude": -96.8,
             "source": "google_maps_scraper",
             "scraped_at": "2026-09-09T00:00:00+00:00",
+            "search_keyword": "hvac",
+            "search_location": "Dallas, TX",
+            "search_id": "dallas-tx_hvac",
+            "run_id": "run_test",
         }
         base.update(overrides)
         return base
@@ -98,10 +104,26 @@ class DedupTests(unittest.TestCase):
             {"title": "Joe's HVAC", "phone": "", "website": "", "address": "123 Main St, Dallas, TX"},
             {"title": "Joe's HVAC LLC", "phone": "214-555-0100", "website": "", "address": "123 Main St, Dallas, TX"},
         ]
-        leads, stats = normalize.normalize_and_dedup(raw_rows, "hvac", "Dallas, TX", "2026-09-09T00:00:00+00:00")
+        leads, stats = normalize.normalize_and_dedup(
+            raw_rows, "hvac", "Dallas, TX", "2026-09-09T00:00:00+00:00", "dallas-tx_hvac", "run_test"
+        )
         self.assertEqual(stats["clean_records"], 1)
         self.assertEqual(stats["duplicates_merged"], 1)
         self.assertEqual(leads[0]["phone"], "214-555-0100")
+
+    def test_normalize_and_dedup_attaches_provenance_fields(self):
+        raw_rows = [
+            {"title": "Joe's HVAC", "phone": "214-555-0100", "address": "123 Main St, Dallas, TX"},
+        ]
+        leads, _ = normalize.normalize_and_dedup(
+            raw_rows, "hvac", "Dallas, TX", "2026-09-09T00:00:00+00:00", "dallas-tx_hvac", "run_test"
+        )
+        self.assertEqual(leads[0]["search_keyword"], "hvac")
+        self.assertEqual(leads[0]["search_location"], "Dallas, TX")
+        self.assertEqual(leads[0]["search_id"], "dallas-tx_hvac")
+        self.assertEqual(leads[0]["run_id"], "run_test")
+        self.assertEqual(leads[0]["source"], "google_maps_scraper")
+        self.assertIn("scraped_at", leads[0])
 
     def test_missing_phone_and_website_flagged_partial(self):
         raw_rows = [
@@ -140,6 +162,10 @@ class OutputWriterTests(unittest.TestCase):
                 "longitude": -96.8,
                 "source": "google_maps_scraper",
                 "scraped_at": "2026-09-09T00:00:00+00:00",
+                "search_keyword": "hvac",
+                "search_location": "Dallas, TX",
+                "search_id": "dallas-tx_hvac",
+                "run_id": "run_test",
             }
         ]
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -176,6 +202,178 @@ class BuildQueryTests(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             build_query.build_query_line("", "Dallas, TX")
+
+
+class SearchPlanTests(unittest.TestCase):
+    def test_parses_multiline_plan_with_explicit_depth(self):
+        text = (
+            "commercial HVAC contractors | Dallas, TX | 3\n"
+            "commercial HVAC companies | Dallas, TX | 3\n"
+        )
+        entries = search_plan.parse_plan(text)
+        self.assertEqual(len(entries), 2)
+        self.assertTrue(all(e["valid"] for e in entries))
+        self.assertEqual(entries[0]["keyword"], "commercial HVAC contractors")
+        self.assertEqual(entries[0]["location"], "Dallas, TX")
+        self.assertEqual(entries[0]["depth"], 3)
+
+    def test_blank_lines_and_comments_are_skipped(self):
+        text = "\n# a comment\n  \nkeyword | location | 2\n"
+        entries = search_plan.parse_plan(text)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["keyword"], "keyword")
+
+    def test_missing_depth_falls_back_to_default(self):
+        entries = search_plan.parse_plan("keyword | location", default_depth=7)
+        self.assertTrue(entries[0]["valid"])
+        self.assertEqual(entries[0]["depth"], 7)
+
+    def test_malformed_line_missing_pipe_is_invalid(self):
+        entries = search_plan.parse_plan("just a keyword with no separators")
+        self.assertFalse(entries[0]["valid"])
+        self.assertIsNotNone(entries[0]["error"])
+
+    def test_malformed_line_empty_keyword_is_invalid(self):
+        entries = search_plan.parse_plan(" | Dallas, TX | 3")
+        self.assertFalse(entries[0]["valid"])
+        self.assertIn("keyword", entries[0]["error"])
+
+    def test_malformed_line_empty_location_is_invalid(self):
+        entries = search_plan.parse_plan("keyword | | 3")
+        self.assertFalse(entries[0]["valid"])
+        self.assertIn("location", entries[0]["error"])
+
+    def test_malformed_line_non_numeric_depth_is_invalid(self):
+        entries = search_plan.parse_plan("keyword | Dallas, TX | deep")
+        self.assertFalse(entries[0]["valid"])
+        self.assertIn("depth", entries[0]["error"])
+
+    def test_malformed_line_zero_depth_is_invalid(self):
+        entries = search_plan.parse_plan("keyword | Dallas, TX | 0")
+        self.assertFalse(entries[0]["valid"])
+
+    def test_valid_and_invalid_lines_mixed_keep_line_numbers(self):
+        text = "keyword | Dallas, TX | 3\nbad line\nother | Austin, TX | 2\n"
+        entries = search_plan.parse_plan(text)
+        self.assertEqual([e["line_no"] for e in entries], [1, 2, 3])
+        self.assertTrue(entries[0]["valid"])
+        self.assertFalse(entries[1]["valid"])
+        self.assertTrue(entries[2]["valid"])
+
+    def test_search_id_is_deterministic_slug_of_location_and_keyword(self):
+        entries = search_plan.parse_plan("commercial HVAC contractors | Dallas, TX | 3")
+        self.assertEqual(entries[0]["search_id"], "dallas-tx_commercial-hvac-contractors")
+
+    def test_search_id_is_stable_across_repeated_parsing(self):
+        text = "commercial HVAC contractors | Dallas, TX | 3"
+        first = search_plan.parse_plan(text)[0]["search_id"]
+        second = search_plan.parse_plan(text)[0]["search_id"]
+        self.assertEqual(first, second)
+
+    def test_duplicate_search_lines_get_distinct_search_ids(self):
+        text = "hvac | Dallas, TX | 3\nhvac | Dallas, TX | 5\n"
+        entries = search_plan.parse_plan(text)
+        ids = [e["search_id"] for e in entries]
+        self.assertEqual(len(ids), len(set(ids)))
+        self.assertEqual(ids[0], "dallas-tx_hvac")
+        self.assertEqual(ids[1], "dallas-tx_hvac-2")
+
+    def test_invalid_lines_never_get_a_search_id(self):
+        entries = search_plan.parse_plan("bad line with no pipe")
+        self.assertNotIn("search_id", entries[0])
+
+
+class BuildManifestTests(unittest.TestCase):
+    def _plan(self):
+        return [
+            {
+                "line_no": 1,
+                "raw": "hvac | Dallas, TX | 3",
+                "valid": True,
+                "keyword": "hvac",
+                "location": "Dallas, TX",
+                "depth": 3,
+                "search_id": "dallas-tx_hvac",
+                "error": None,
+            },
+            {
+                "line_no": 2,
+                "raw": "plumbing | Dallas, TX | 3",
+                "valid": True,
+                "keyword": "plumbing",
+                "location": "Dallas, TX",
+                "depth": 3,
+                "search_id": "dallas-tx_plumbing",
+                "error": None,
+            },
+            {
+                "line_no": 3,
+                "raw": "bad line",
+                "valid": False,
+                "error": "expected 'keyword | location'",
+            },
+        ]
+
+    def test_manifest_marks_run_fully_successful(self):
+        plan = self._plan()[:2]
+        results = [
+            {"search_id": "dallas-tx_hvac", "status": "success", "stats": {"raw_records": 10, "clean_records": 9, "malformed_skipped": 1, "duplicates_merged": 0, "partial_records_missing_phone_and_website": 2}},
+            {"search_id": "dallas-tx_plumbing", "status": "success", "stats": {"raw_records": 5, "clean_records": 5, "malformed_skipped": 0, "duplicates_merged": 0, "partial_records_missing_phone_and_website": 0}},
+        ]
+        manifest = build_manifest.build_manifest("run_test", plan, results, timestamp="2026-09-09T00:00:00Z")
+        self.assertEqual(manifest["overall_status"], "success")
+        self.assertEqual(manifest["totals"]["successful"], 2)
+        self.assertEqual(manifest["totals"]["failed"], 0)
+        self.assertEqual(manifest["successful_searches"][0]["clean_record_count"], 9)
+
+    def test_manifest_reports_partial_failure_when_one_search_fails(self):
+        plan = self._plan()[:2]
+        results = [
+            {"search_id": "dallas-tx_hvac", "status": "success", "stats": {"raw_records": 10, "clean_records": 9, "malformed_skipped": 1, "duplicates_merged": 0, "partial_records_missing_phone_and_website": 0}},
+            {"search_id": "dallas-tx_plumbing", "status": "failed", "error": "scraper exited with status 1"},
+        ]
+        manifest = build_manifest.build_manifest("run_test", plan, results, timestamp="2026-09-09T00:00:00Z")
+        self.assertEqual(manifest["overall_status"], "partial_failure")
+        self.assertEqual(len(manifest["successful_searches"]), 1)
+        self.assertEqual(len(manifest["failed_searches"]), 1)
+        self.assertEqual(manifest["failed_searches"][0]["search_id"], "dallas-tx_plumbing")
+        self.assertEqual(manifest["failed_searches"][0]["error"], "scraper exited with status 1")
+
+    def test_manifest_reports_failed_when_all_searches_fail(self):
+        plan = self._plan()[:2]
+        results = [
+            {"search_id": "dallas-tx_hvac", "status": "failed", "error": "boom"},
+            {"search_id": "dallas-tx_plumbing", "status": "failed", "error": "boom"},
+        ]
+        manifest = build_manifest.build_manifest("run_test", plan, results, timestamp="2026-09-09T00:00:00Z")
+        self.assertEqual(manifest["overall_status"], "failed")
+
+    def test_manifest_includes_invalid_lines_and_still_reports_partial_failure(self):
+        plan = self._plan()
+        results = [
+            {"search_id": "dallas-tx_hvac", "status": "success", "stats": {"raw_records": 1, "clean_records": 1, "malformed_skipped": 0, "duplicates_merged": 0, "partial_records_missing_phone_and_website": 0}},
+            {"search_id": "dallas-tx_plumbing", "status": "success", "stats": {"raw_records": 1, "clean_records": 1, "malformed_skipped": 0, "duplicates_merged": 0, "partial_records_missing_phone_and_website": 0}},
+        ]
+        manifest = build_manifest.build_manifest("run_test", plan, results, timestamp="2026-09-09T00:00:00Z")
+        self.assertEqual(len(manifest["invalid_search_lines"]), 1)
+        self.assertEqual(manifest["overall_status"], "partial_failure")
+
+    def test_manifest_missing_result_record_counts_as_failed(self):
+        plan = self._plan()[:1]
+        manifest = build_manifest.build_manifest("run_test", plan, [], timestamp="2026-09-09T00:00:00Z")
+        self.assertEqual(manifest["overall_status"], "failed")
+        self.assertEqual(len(manifest["failed_searches"]), 1)
+
+    def test_manifest_with_no_requested_searches_is_failed(self):
+        manifest = build_manifest.build_manifest("run_test", [], [], timestamp="2026-09-09T00:00:00Z")
+        self.assertEqual(manifest["overall_status"], "failed")
+
+    def test_manifest_carries_run_id_and_timestamp(self):
+        manifest = build_manifest.build_manifest("run_test", self._plan()[:1], [
+            {"search_id": "dallas-tx_hvac", "status": "success", "stats": {"raw_records": 1, "clean_records": 1, "malformed_skipped": 0, "duplicates_merged": 0, "partial_records_missing_phone_and_website": 0}}
+        ], timestamp="2026-09-09T00:00:00Z")
+        self.assertEqual(manifest["run_id"], "run_test")
+        self.assertEqual(manifest["generated_at"], "2026-09-09T00:00:00Z")
 
 
 if __name__ == "__main__":

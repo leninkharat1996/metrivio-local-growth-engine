@@ -1,6 +1,6 @@
 ---
 name: google-maps-scraper
-description: Run the Google Maps prospecting scrape (gosom/google-maps-scraper) for a business category + location, normalize/dedupe results deterministically, and report counts. Use when the user asks to find/scrape businesses on Google Maps, gather local leads, or trigger a prospecting run for a keyword and city/state.
+description: Run the Google Maps prospecting scrape (gosom/google-maps-scraper) for one or many keyword+location searches via the production collection workflow, normalize/dedupe results deterministically, and report per-search + run-level counts. Use when the user asks to find/scrape businesses on Google Maps, gather local leads, or trigger a prospecting run across one or more keyword/location combinations.
 ---
 
 # Google Maps Scraper Skill
@@ -11,89 +11,154 @@ listings — no email finding, enrichment, CRM, or outreach happens here.
 
 ## What this skill does
 
-1. Accepts a `keyword` (business category, e.g. "commercial HVAC contractors")
-   and a `location` (city/state, e.g. "Dallas, TX").
-2. Triggers the `google-maps-scraper.yml` GitHub Actions workflow (or runs the
-   equivalent commands locally in CI) using `gosom/google-maps-scraper`
-   (MIT licensed, free, no paid API keys).
-3. The workflow writes raw scraper output to `data/google-maps/raw/`.
-4. `scripts/google_maps_scraper/normalize.py` deterministically normalizes and
-   deduplicates the raw output into the canonical lead schema (see below) and
-   writes CSV + JSON to `data/google-maps/clean/`.
-5. Reports: total businesses found, clean records after dedup, duplicates
-   merged, and partial/incomplete records (missing both phone and website).
+Triggers the `Google Maps Scraper` GitHub Actions workflow
+(`.github/workflows/google-maps-scraper.yml`) with a **search plan**: one or
+more keyword+location searches run in a single, auditable run. Each search is
+validated, queried, scraped, normalized, and deduped independently, and a
+run manifest ties everything together.
 
-**Do all normalization/dedup with the Python script, not by reasoning over
-rows.** That keeps token usage low and results deterministic and reproducible.
+**Do all parsing/normalization/dedup/manifest work with the Python scripts,
+not by reasoning over rows.** That keeps token usage low and results
+deterministic and reproducible.
 
-## How to run it
+## Search-plan format
 
-### Preferred: GitHub Actions (no local install required)
+One search per line:
 
-Trigger the `Google Maps Scraper` workflow (`.github/workflows/google-maps-scraper.yml`)
-via `workflow_dispatch` with inputs:
+```
+keyword | location | depth
+```
 
-- `keyword` — e.g. `commercial HVAC contractors`
-- `location` — e.g. `Dallas, TX`
-- `depth` — optional, default `5` (higher = more results, slower)
+- `keyword` — business category, e.g. `commercial HVAC contractors`
+- `location` — city/state or full location string, e.g. `Dallas, TX`
+- `depth` — optional; a positive integer (scroll depth — more depth = more
+  results per search, slower). Omit it to fall back to the workflow's
+  `default_depth` input.
 
-The workflow:
-1. Checks out this repo and `gosom/google-maps-scraper` side by side.
-2. Builds the scraper with Go (Playwright/Chromium is fetched automatically
-   on first run — nothing to install manually).
-3. Builds the query file via `scripts/google_maps_scraper/build_query.py`.
-4. Runs the scraper, writing raw CSV to `data/google-maps/raw/`.
-5. Runs `scripts/google_maps_scraper/normalize.py` to produce clean
-   CSV + JSON in `data/google-maps/clean/`.
-6. Uploads both raw and clean outputs as workflow artifacts (raw kept 30
-   days, clean kept 90 days) — nothing is committed to the repo automatically.
+Blank lines and lines starting with `#` are ignored. Example plan:
 
-If asked to "trigger a scrape" or "run a prospecting search", tell the user to
-dispatch this workflow from the GitHub Actions tab (or use `gh workflow run
-google-maps-scraper.yml -f keyword="..." -f location="..." -f depth="5"` if
+```
+commercial HVAC contractors | Dallas, TX | 3
+commercial HVAC companies | Dallas, TX | 3
+industrial HVAC contractors | Dallas, TX | 3
+```
+
+Never hard-code a specific city/keyword into the workflow or scripts — the
+plan is always supplied by the caller at dispatch time.
+
+### Choosing keywords
+
+Use distinct, specific phrasings per line rather than one broad keyword —
+Google Maps returns different result sets for "HVAC contractors" vs "HVAC
+companies" vs "air conditioning repair", so a small set of close variants
+covers more of the market than one search repeated.
+
+### Choosing locations
+
+One line per city/metro, using whatever specificity Google Maps understands
+("Dallas, TX", "Dallas-Fort Worth, TX", or a ZIP). Don't combine multiple
+cities into a single location string — put each on its own line so results
+and provenance stay attributable to one place.
+
+### Choosing depth
+
+Depth controls how far the scraper scrolls per search, not how many searches
+run. Start with a low depth (1-3) for a smoke test or exploratory pass;
+raise it (5-10+) only for a search you already know is worth collecting
+deeply, since higher depth means a longer-running, slower search line. Keep
+production batches to a handful of lines at a controlled depth rather than
+one enormous plan — see "Controlled batches" below.
+
+## How to launch a collection
+
+Dispatch the `Google Maps Scraper` workflow
+(`.github/workflows/google-maps-scraper.yml`) via `workflow_dispatch` with:
+
+- `search_plan` — the multiline plan described above (required)
+- `default_depth` — depth used for any line that omits its own depth
+  (optional, default `5`)
+
+For each valid line the workflow:
+1. Validates the line deterministically (`scripts/google_maps_scraper/search_plan.py`)
+   and assigns a deterministic `search_id` (slug of location + keyword,
+   deduplicated if two lines collide).
+2. Builds the query file (`build_query.py`) and runs
+   `gosom/google-maps-scraper` (MIT licensed, free, no paid API keys).
+3. Normalizes + dedupes the raw output (`normalize.py`) into the canonical
+   lead schema, stamping every record with `search_keyword`, `search_location`,
+   `search_id`, and `run_id` for provenance.
+4. Writes outputs to `data/google-maps/<run_id>/<search_id>/{raw,clean}/`
+   so two searches in the same run can never mix their records.
+
+A search line failing (scraper crash, non-zero exit, etc.) does **not** stop
+the run — the workflow records the failure and continues to the next line.
+
+If asked to "trigger a scrape" or "run a prospecting search", tell the user
+to dispatch this workflow from the GitHub Actions tab (or use `gh workflow
+run google-maps-scraper.yml -f search_plan="..." -f default_depth="5"` if
 `gh` is available) rather than running anything locally.
 
-### Direct script usage (e.g. inside an existing CI job or sandbox)
+## Where artifacts appear
 
-```bash
-# 1. Build the query line
-python3 scripts/google_maps_scraper/build_query.py \
-  --keyword "commercial HVAC contractors" --location "Dallas, TX" \
-  --out queries.txt
+On the workflow run page, under **Artifacts**:
 
-# 2. Run the upstream scraper (already built at ./google-maps-scraper/google-maps-scraper)
-./google-maps-scraper/google-maps-scraper \
-  -input queries.txt -results data/google-maps/raw/dallas_hvac.csv -depth 5
+- `google-maps-raw-<run_id>` — untouched scraper output per search
+- `google-maps-clean-csv-<run_id>` — canonical-schema CSV per search
+- `google-maps-clean-json-<run_id>` — canonical-schema JSON per search
+- `google-maps-manifest-<run_id>` — `manifest.json`: the run's machine-readable
+  record and run statistics (see below)
 
-# 3. Normalize + dedupe deterministically
-python3 scripts/google_maps_scraper/normalize.py \
-  --raw-csv data/google-maps/raw/dallas_hvac.csv \
-  --category "commercial HVAC contractors" \
-  --location "Dallas, TX" \
-  --out-prefix data/google-maps/clean/dallas_hvac
-```
+Nothing under `data/google-maps/` is committed to the repo — it's
+`.gitignore`d by default (only `data/google-maps/.gitkeep` is tracked).
+Commit a dataset only when the user explicitly asks to keep it.
 
-The normalize script prints a JSON stats block to stdout:
+## How to interpret the manifest
 
-```json
-{
-  "raw_records": 42,
-  "malformed_skipped": 1,
-  "duplicates_merged": 3,
-  "clean_records": 38,
-  "partial_records_missing_phone_and_website": 2,
-  "csv_path": "data/google-maps/clean/dallas_hvac.csv",
-  "json_path": "data/google-maps/clean/dallas_hvac.json"
-}
-```
+`manifest.json` (built by `scripts/google_maps_scraper/build_manifest.py`)
+contains:
 
-Report these numbers back to the user directly — do not re-derive counts by
-reading the CSV yourself.
+- `run_id`, `generated_at` — run identity/timestamp
+- `overall_status` — `success`, `partial_failure`, or `failed` (see below)
+- `requested_searches` — every valid line that was attempted
+- `invalid_search_lines` — lines that failed validation before any scraping
+  (with the line number and a human-readable error)
+- `successful_searches` — per-search stats: `raw_record_count`,
+  `clean_record_count`, `malformed_count`, `duplicate_count`,
+  `partial_count`, plus the artifact paths for that search
+- `failed_searches` — per-search failure reason
+- `totals` — requested/valid/invalid/successful/failed counts for the whole run
+
+Report these numbers back to the user directly from the manifest — do not
+re-derive counts by reading CSV/JSON output yourself.
+
+## How to handle partial failures
+
+- `overall_status: "success"` — every requested line was valid and every
+  search succeeded. The workflow job itself is green.
+- `overall_status: "partial_failure"` — at least one line was invalid or one
+  search failed, but at least one search succeeded. The workflow job is
+  marked **failed** (so a partial run is never mistaken for a clean one),
+  but all artifacts from the searches that did succeed are still uploaded.
+- `overall_status: "failed"` — no search succeeded (or the plan had zero
+  valid lines).
+
+When a run comes back `partial_failure` or `failed`, read `invalid_search_lines`
+and `failed_searches` in the manifest, tell the user exactly which lines/
+searches failed and why, and only re-dispatch the workflow for the failed
+lines (not the whole original plan) unless asked otherwise.
+
+## Controlled batches
+
+Production collection should be run in controlled batches — a handful of
+search lines (e.g. 3-10) per dispatch, at a depth appropriate to that batch —
+rather than one very large plan. This keeps each run's blast radius small,
+keeps run time under the workflow's timeout, and keeps the manifest easy to
+audit line-by-line before triggering the next batch.
 
 ## Canonical lead schema
 
-Every row in `data/google-maps/clean/*.csv` and `*.json` has exactly these
-fields (see `scripts/google_maps_scraper/normalize.py::CANONICAL_FIELDS`):
+Every row in a search's `clean/*.csv` and `*.json` has exactly these fields
+(see `scripts/google_maps_scraper/normalize.py::CANONICAL_FIELDS`):
 
 | Field | Notes |
 |---|---|
@@ -112,14 +177,21 @@ fields (see `scripts/google_maps_scraper/normalize.py::CANONICAL_FIELDS`):
 | `longitude` | Float, may be null |
 | `source` | Always `google_maps_scraper` |
 | `scraped_at` | UTC ISO-8601 timestamp of the normalize run |
+| `search_keyword` | The keyword line used for this search (provenance) |
+| `search_location` | The location line used for this search (provenance) |
+| `search_id` | Deterministic id for the search that produced this record |
+| `run_id` | Deterministic id for the overall collection run |
 
 Raw scraper output (with any extra upstream fields such as opening hours,
-price range, review text) is preserved unmodified in `data/google-maps/raw/`
-— the clean schema above is intentionally narrow.
+price range, review text) is preserved unmodified in
+`data/google-maps/<run_id>/<search_id>/raw/` — the clean schema above is
+intentionally narrow.
 
 ## Deduplication rules (deterministic, no AI)
 
-A record is a duplicate of an earlier one if, in priority order:
+Deduplication happens **within each search**, not across the whole run. A
+record is a duplicate of an earlier one in the same search if, in priority
+order:
 1. Website domains match (`example.com` == `www.example.com`).
 2. Phone numbers match after stripping formatting/country code.
 3. Normalized business name AND normalized address match (punctuation,
@@ -128,27 +200,6 @@ A record is a duplicate of an earlier one if, in priority order:
 
 When two records collide, the one with more complete contact info (has a
 phone or website) is kept.
-
-## Failed / partial records
-
-- **Malformed**: raw rows with no business name are dropped and counted in
-  `malformed_skipped`.
-- **Partial**: clean records missing both `phone` and `website` are counted
-  in `partial_records_missing_phone_and_website` — still included in output,
-  just flagged in the stats so downstream layers know which leads need more
-  work.
-
-## Output locations
-
-```
-data/google-maps/raw/<slug>_<timestamp>.csv     # untouched scraper output
-data/google-maps/clean/<slug>_<timestamp>.csv   # canonical schema, deduped
-data/google-maps/clean/<slug>_<timestamp>.json  # same data, machine-readable
-```
-
-These directories are gitignored by default (see repo `.gitignore`) so scrape
-runs don't silently accumulate into the git history — commit a dataset only
-when the user explicitly asks to keep it.
 
 ## Explicitly out of scope for this skill
 
