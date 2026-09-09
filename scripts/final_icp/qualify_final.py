@@ -218,7 +218,13 @@ def evaluate_hard_exclusions(
 ) -> list[str]:
     reasons: list[str] = []
     prelim_exclusions = prelim.get("icp_exclusions") or []
-    hard_reasons = [r for r in prelim_exclusions if r.startswith("hard exclusion:")]
+    # Residential-only exclusions are NOT handled here -- they have their
+    # own rescue rule (evaluate_residential_only, STEP 3) and must never be
+    # carried through as a non-rescuable hard exclusion at this step.
+    hard_reasons = [
+        r for r in prelim_exclusions
+        if r.startswith("hard exclusion:") and "residential-only" not in r
+    ]
 
     single_trade_reasons = [r for r in hard_reasons if any(lbl in r for lbl in SINGLE_TRADE_LABELS)]
     other_hard_reasons = [r for r in hard_reasons if r not in single_trade_reasons]
@@ -513,7 +519,10 @@ def score_to_tier(
     for band, min_score in band_order:
         if score >= min_score and _tier_gate_satisfied(band, status, n_hvac, n_bucket2, evidence_source, website_status):
             return band
-    return "D"
+    # Only an excluded record may reach D (handled above). A qualified or
+    # review record always floors at C, even when its score falls below
+    # the C band's own min_score threshold.
+    return "C"
 
 
 # ---------------------------------------------------------------------------

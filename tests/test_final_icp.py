@@ -179,6 +179,69 @@ class ResidentialTests(unittest.TestCase):
         self.assertEqual(r["final_icp_status"], "excluded")
         self.assertEqual(r["final_icp_tier"], "D")
 
+    def test_A_preliminary_residential_only_rescued_by_website_direct_hvac_qualifies(self):
+        # Test A (FIX 1 regression): a preliminary residential-only
+        # exclusion must be rescuable by genuine website direct-service
+        # HVAC evidence, exactly like the single-trade rescue.
+        evidence = [
+            make_evidence("commercial_hvac"),
+            make_evidence("maintenance_contract"),
+        ]
+        r = classify(
+            evidence=evidence,
+            prelim_overrides={
+                "icp_evidence": ["residential_only_signal"],
+                "icp_exclusions": [
+                    "hard exclusion: residential-only keyword(s) ['residential'] matched with no commercial signal present"
+                ],
+                "icp_confidence": "low",
+                "icp_status": "excluded",
+            },
+        )
+        self.assertEqual(r["final_icp_status"], "qualified")
+        self.assertNotEqual(r["final_icp_status"], "excluded")
+        self.assertEqual(r["exclusion_reasons"], [])
+
+    def test_B_preliminary_residential_only_with_only_residential_website_evidence_stays_excluded(self):
+        # Test B: no genuine commercial HVAC evidence on the website at
+        # all -- the residential-only exclusion must NOT be rescued.
+        evidence = [make_evidence("residential", "residential", evidence_type="residential")]
+        r = classify(
+            evidence=evidence,
+            prelim_overrides={
+                "icp_evidence": ["residential_only_signal"],
+                "icp_exclusions": [
+                    "hard exclusion: residential-only keyword(s) ['residential'] matched with no commercial signal present"
+                ],
+                "icp_confidence": "low",
+                "icp_status": "excluded",
+            },
+        )
+        self.assertEqual(r["final_icp_status"], "excluded")
+
+    def test_C_preliminary_residential_only_with_only_incidental_hvac_never_qualifies(self):
+        # Test C: only INCIDENTAL commercial HVAC mention (not
+        # direct_service) -- must never be rescued into qualified. It may
+        # remain excluded (no direct rescue evidence) or fall to review,
+        # but qualified is explicitly disallowed.
+        evidence = [
+            make_evidence("commercial_hvac", evidence_type="incidental"),
+            make_evidence("residential", "residential", evidence_type="residential"),
+        ]
+        r = classify(
+            evidence=evidence,
+            prelim_overrides={
+                "icp_evidence": ["residential_only_signal"],
+                "icp_exclusions": [
+                    "hard exclusion: residential-only keyword(s) ['residential'] matched with no commercial signal present"
+                ],
+                "icp_confidence": "low",
+                "icp_status": "excluded",
+            },
+        )
+        self.assertNotEqual(r["final_icp_status"], "qualified")
+        self.assertIn(r["final_icp_status"], ("excluded", "review"))
+
 
 class HardExclusionTests(unittest.TestCase):
     def test_hvac_supply_house_excluded_via_website_pattern(self):
@@ -305,8 +368,14 @@ class TierBoundaryTests(unittest.TestCase):
     def test_score_14_is_d_for_excluded(self):
         self.assertEqual(self._score_row(14, status="excluded"), "D")
 
-    def test_score_14_floors_at_d_for_qualified_too(self):
-        self.assertEqual(self._score_row(14, status="qualified"), "D")
+    def test_score_14_floors_at_c_for_qualified(self):
+        self.assertEqual(self._score_row(14, status="qualified", n_hvac=0, n_bucket2=0), "C")
+
+    def test_score_14_floors_at_c_for_review(self):
+        self.assertEqual(self._score_row(14, status="review", n_hvac=0, n_bucket2=0), "C")
+
+    def test_score_0_floors_at_c_for_qualified(self):
+        self.assertEqual(self._score_row(0, status="qualified", n_hvac=0, n_bucket2=0), "C")
 
     def test_a_plus_gate_fails_with_only_one_bucket1_category(self):
         self.assertEqual(self._score_row(90, n_hvac=1, n_bucket2=1), "A")
