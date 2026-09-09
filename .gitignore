@@ -17,6 +17,12 @@ queries.txt
 data/icp/*
 !data/icp/.gitkeep
 
+# Generated website enrichment output (Step 9) - deterministic derived
+# evidence data, never committed. Regenerate any time with
+# scripts/enrichment/enrich_websites.py.
+data/enrichment/*
+!data/enrichment/.gitkeep
+
 # Python
 __pycache__/
 *.pyc
