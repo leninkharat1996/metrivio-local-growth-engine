@@ -223,6 +223,28 @@ jobs:
             exit 1
           fi
 
+      # --------------------------------------------------------------
+      # Stage 4b -- Final ICP validation report (record-level
+      # observability only; reads Stage 4's existing output verbatim,
+      # makes no qualification decisions of its own). Prints the
+      # mandatory "FINAL ICP VALIDATION RECORDS" section directly to
+      # these Actions logs so results can be inspected without needing
+      # to download the (currently unreachable) workflow artifact.
+      # --------------------------------------------------------------
+      - name: "Stage 4b: Final ICP validation report (record-level observability)"
+        id: stage4b
+        run: |
+          set -euo pipefail
+          python3 scripts/production_pipeline/build_validation_report.py \
+            --final-icp-json data/final_icp/final_icp_qualified.json \
+            --master-json data/master/master.json \
+            --current-run-id "run_${{ steps.stage1_trigger.outputs.run_id }}_1" \
+            --out-dir data/final_icp
+          if [ ! -f data/final_icp/final_icp_validation.json ] || [ ! -f data/final_icp/final_icp_validation.csv ]; then
+            echo "::error::Final ICP validation report stage did not produce the expected output files."
+            exit 1
+          fi
+
       - name: Build pipeline summary
         id: summary
         if: always()
@@ -265,6 +287,8 @@ jobs:
           path: |
             data/final_icp/final_icp_qualified.json
             data/final_icp/final_icp_qualified.csv
+            data/final_icp/final_icp_validation.json
+            data/final_icp/final_icp_validation.csv
             data/enrichment/website_enrichment.json
             data/enrichment/website_enrichment.csv
             data/icp/icp_qualified.json
@@ -286,7 +310,8 @@ jobs:
             "${{ steps.stage1_master.outcome }}" \
             "${{ steps.stage2.outcome }}" \
             "${{ steps.stage3.outcome }}" \
-            "${{ steps.stage4.outcome }}"; do
+            "${{ steps.stage4.outcome }}" \
+            "${{ steps.stage4b.outcome }}"; do
             if [ "${outcome}" != "success" ]; then
               echo "::error::Production pipeline had a stage with outcome '${outcome}'; failing the run."
               exit 1
