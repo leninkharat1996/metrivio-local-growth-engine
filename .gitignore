@@ -29,6 +29,16 @@ data/enrichment/*
 data/final_icp/*
 !data/final_icp/.gitkeep
 
+# Generated production pipeline run outputs (Step 11A) - deterministic
+# per-run stats/summary, never committed. Regenerate any time by running
+# .github/workflows/production-pipeline.yml.
+search_plan.txt
+plan.json
+icp_stats.json
+enrichment_stats.json
+final_icp_stats.json
+pipeline_summary.json
+
 # Python
 __pycache__/
 *.pyc

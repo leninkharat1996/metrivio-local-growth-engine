@@ -1,0 +1,295 @@
+name: Production Pipeline Runner
+
+# Step 11A -- controlled orchestration workflow only. It does NOT
+# reimplement any stage: it dispatches the existing Google Maps collection
+# workflow (.github/workflows/google-maps-scraper.yml) and then invokes the
+# existing preliminary ICP, website enrichment, and final ICP CLIs exactly
+# as they already exist, in order, against the resulting persistent master
+# store.
+#
+# ONLY workflow_dispatch. No push trigger, no schedule, no automatic
+# production execution.
+on:
+  workflow_dispatch:
+    inputs:
+      search_plan:
+        description: >
+          One search per line: "keyword | location | depth". Passed through
+          unchanged to the existing Google Maps collection workflow. Blank
+          lines and lines starting with # are ignored. Example:
+          commercial HVAC contractors | Dallas, TX | 1
+        required: true
+        type: string
+      max_pages_per_domain:
+        description: "Max same-domain pages the website enrichment stage crawls per business"
+        required: false
+        type: string
+        default: "5"
+      request_timeout:
+        description: "Per-request timeout (seconds) for the website enrichment stage"
+        required: false
+        type: string
+        default: "20"
+      user_agent:
+        description: "User-Agent string sent by the website enrichment stage. Must identify this project; never impersonate a browser."
+        required: false
+        type: string
+        default: "MetrivioLocalGrowthEngine/1.0"
+
+concurrency:
+  group: metrivio-production-pipeline
+  cancel-in-progress: false
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - name: Checkout metrivio-local-growth-engine
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install repository Python dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Prepare run metadata
+        id: meta
+        run: |
+          set -euo pipefail
+          started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          echo "started_at=${started_at}" >> "$GITHUB_OUTPUT"
+          echo "run_id=${{ github.run_id }}" >> "$GITHUB_OUTPUT"
+          echo "commit_sha=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+
+      - name: Validate search plan
+        id: plan
+        run: |
+          set -euo pipefail
+          cat > search_plan.txt <<'PLAN_EOF'
+          ${{ inputs.search_plan }}
+          PLAN_EOF
+          python3 scripts/google_maps_scraper/search_plan.py \
+            --plan-file search_plan.txt \
+            --default-depth 1 \
+            --out plan.json
+          valid_count=$(python3 -c "import json; print(sum(1 for e in json.load(open('plan.json')) if e['valid']))")
+          if [ "${valid_count}" -eq 0 ]; then
+            echo "::error::search_plan contains no valid search lines; refusing to start the pipeline."
+            exit 1
+          fi
+          echo "searches_requested=${valid_count}" >> "$GITHUB_OUTPUT"
+          echo "Parsed search plan (${valid_count} valid search line(s)):"
+          cat plan.json
+
+      # --------------------------------------------------------------
+      # Stage 1 -- Google Maps collection
+      #
+      # Dispatches the existing, unmodified google-maps-scraper.yml
+      # workflow (never reimplemented here) and waits for it to finish
+      # updating the persistent master store exactly as it already does
+      # on its own. The search_plan format is identical, so it is passed
+      # through unchanged.
+      # --------------------------------------------------------------
+      - name: "Stage 1: Trigger existing Google Maps collection workflow"
+        id: stage1_trigger
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          before_run_id=$(gh run list --workflow google-maps-scraper.yml --limit 1 --json databaseId --jq '.[0].databaseId // 0')
+          echo "Most recent existing google-maps-scraper.yml run before dispatch: ${before_run_id}"
+
+          gh workflow run google-maps-scraper.yml \
+            --ref "${{ github.ref_name }}" \
+            -f search_plan="${{ inputs.search_plan }}"
+
+          new_run_id=""
+          for _ in $(seq 1 30); do
+            sleep 5
+            candidate=$(gh run list --workflow google-maps-scraper.yml --limit 1 --json databaseId --jq '.[0].databaseId // 0')
+            if [ "${candidate}" != "0" ] && [ "${candidate}" != "${before_run_id}" ]; then
+              new_run_id="${candidate}"
+              break
+            fi
+          done
+
+          if [ -z "${new_run_id}" ]; then
+            echo "::error::Timed out waiting for a new google-maps-scraper.yml run to appear after dispatch."
+            exit 1
+          fi
+
+          echo "Dispatched google-maps-scraper.yml run ${new_run_id}"
+          echo "run_id=${new_run_id}" >> "$GITHUB_OUTPUT"
+
+      - name: "Stage 1: Wait for Google Maps collection to complete"
+        id: stage1_wait
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          run_id="${{ steps.stage1_trigger.outputs.run_id }}"
+          gh run watch "${run_id}" --exit-status
+
+      - name: "Stage 1: Download updated master store"
+        id: stage1_master
+        if: always() && steps.stage1_wait.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          run_id="${{ steps.stage1_trigger.outputs.run_id }}"
+          artifact_name=$(gh api "repos/${GH_REPO}/actions/runs/${run_id}/artifacts?per_page=100" \
+            --jq '[.artifacts[] | select(.name | startswith("google-maps-master-store-"))][0].name // ""')
+
+          if [ -z "${artifact_name}" ]; then
+            echo "::error::google-maps-scraper.yml run ${run_id} produced no master-store artifact; refusing to continue with a stale/empty master store."
+            exit 1
+          fi
+
+          mkdir -p data/master
+          gh run download "${run_id}" --repo "${GH_REPO}" --name "${artifact_name}" --dir data/master
+
+          if [ ! -f data/master/master.json ]; then
+            echo "::error::Downloaded artifact '${artifact_name}' from run ${run_id} but data/master/master.json is missing."
+            exit 1
+          fi
+          echo "Master store updated from google-maps-scraper.yml run ${run_id} (artifact ${artifact_name})."
+
+      # --------------------------------------------------------------
+      # Stage 2 -- Preliminary ICP (existing implementation, existing rules)
+      # --------------------------------------------------------------
+      - name: "Stage 2: Preliminary ICP qualification"
+        id: stage2
+        run: |
+          set -euo pipefail
+          python3 scripts/icp/qualify.py \
+            --master-json data/master/master.json \
+            --rules config/icp_rules.json \
+            --out-dir data/icp \
+            | tee icp_stats.json
+          if [ ! -f data/icp/icp_qualified.json ]; then
+            echo "::error::Preliminary ICP stage did not produce data/icp/icp_qualified.json."
+            exit 1
+          fi
+
+      # --------------------------------------------------------------
+      # Stage 3 -- Website enrichment (existing Scrapling implementation)
+      # --------------------------------------------------------------
+      - name: "Stage 3: Website enrichment"
+        id: stage3
+        run: |
+          set -euo pipefail
+          python3 scripts/enrichment/enrich_websites.py \
+            --master-json data/master/master.json \
+            --out-dir data/enrichment \
+            --max-pages "${{ inputs.max_pages_per_domain }}" \
+            --timeout "${{ inputs.request_timeout }}" \
+            --user-agent "${{ inputs.user_agent }}" \
+            | tee enrichment_stats.json
+          if [ ! -f data/enrichment/website_enrichment.json ]; then
+            echo "::error::Website enrichment stage did not produce data/enrichment/website_enrichment.json."
+            exit 1
+          fi
+
+      # --------------------------------------------------------------
+      # Stage 4 -- Final ICP qualification (existing implementation, existing rules)
+      # --------------------------------------------------------------
+      - name: "Stage 4: Final ICP qualification"
+        id: stage4
+        run: |
+          set -euo pipefail
+          python3 scripts/final_icp/qualify_final.py \
+            --master-json data/master/master.json \
+            --preliminary-json data/icp/icp_qualified.json \
+            --enrichment-json data/enrichment/website_enrichment.json \
+            --rules config/final_icp_rules.json \
+            --out-dir data/final_icp \
+            | tee final_icp_stats.json
+          if [ ! -f data/final_icp/final_icp_qualified.json ] || [ ! -f data/final_icp/final_icp_qualified.csv ]; then
+            echo "::error::Final ICP stage did not produce the expected output files."
+            exit 1
+          fi
+
+      - name: Build pipeline summary
+        id: summary
+        if: always()
+        run: |
+          set -euo pipefail
+          completed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          status="failed"
+          if [ "${{ steps.stage4.outcome }}" = "success" ]; then
+            status="success"
+          fi
+
+          args=(
+            --run-id "${{ steps.meta.outputs.run_id }}"
+            --commit-sha "${{ steps.meta.outputs.commit_sha }}"
+            --started-at "${{ steps.meta.outputs.started_at }}"
+            --completed-at "${completed_at}"
+            --searches-requested "${{ steps.plan.outputs.searches_requested }}"
+            --master-json data/master/master.json
+            --pipeline-status "${status}"
+            --out pipeline_summary.json
+          )
+          [ -f icp_stats.json ] && args+=(--preliminary-stats icp_stats.json)
+          [ -f enrichment_stats.json ] && args+=(--enrichment-stats enrichment_stats.json)
+          [ -f final_icp_stats.json ] && args+=(--final-icp-stats final_icp_stats.json)
+
+          python3 scripts/production_pipeline/build_summary.py "${args[@]}"
+
+      - name: Print pipeline summary
+        if: always() && steps.summary.outcome == 'success'
+        run: |
+          echo "===== Metrivio Production Pipeline Summary ====="
+          cat pipeline_summary.json
+          echo "=================================================="
+
+      - name: Upload production pipeline artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: metrivio-production-pipeline-${{ github.run_id }}
+          path: |
+            data/final_icp/final_icp_qualified.json
+            data/final_icp/final_icp_qualified.csv
+            data/enrichment/website_enrichment.json
+            data/enrichment/website_enrichment.csv
+            data/icp/icp_qualified.json
+            data/icp/icp_qualified.csv
+            icp_stats.json
+            enrichment_stats.json
+            final_icp_stats.json
+            pipeline_summary.json
+          if-no-files-found: warn
+          retention-days: 90
+
+      - name: Fail the workflow if any stage did not succeed
+        if: always()
+        run: |
+          set -euo pipefail
+          for outcome in \
+            "${{ steps.stage1_trigger.outcome }}" \
+            "${{ steps.stage1_wait.outcome }}" \
+            "${{ steps.stage1_master.outcome }}" \
+            "${{ steps.stage2.outcome }}" \
+            "${{ steps.stage3.outcome }}" \
+            "${{ steps.stage4.outcome }}"; do
+            if [ "${outcome}" != "success" ]; then
+              echo "::error::Production pipeline had a stage with outcome '${outcome}'; failing the run."
+              exit 1
+            fi
+          done
+          echo "All production pipeline stages completed successfully."
