@@ -148,46 +148,86 @@ def build_validation_records(
     return records
 
 
+def sanitize_for_log(value):
+    """Make an externally sourced value safe to print as part of a GitHub
+    Actions log line.
+
+    GitHub Actions interprets any stdout line that *starts* with
+    ``::name::`` (optionally after leading whitespace) as a workflow
+    command (``::error::``, ``::add-mask::``, ``::stop-commands::``, ...).
+    A record field (business name, website, evidence text, etc.) is
+    external, untrusted data and must never be able to (a) introduce a new
+    line via an embedded newline, or (b) itself begin with a ``::``
+    command prefix. This is display-only sanitization for the printed
+    report section -- it must never be applied to the JSON/CSV output,
+    which preserves the original field values verbatim.
+    """
+    if value is None:
+        return value
+    text = str(value)
+    # (a) collapse embedded newlines so a value can never spawn extra log
+    # lines of its own.
+    text = text.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+    # (b) neutralize a leading "::" workflow-command prefix (allowing for
+    # leading whitespace) without mangling "::" that appears mid-string.
+    lstripped = text.lstrip()
+    if lstripped.startswith("::"):
+        idx = len(text) - len(lstripped)
+        text = text[:idx] + ": " + lstripped[1:]
+    return text
+
+
 def _location(record: dict) -> str:
-    city = record.get("city") or ""
-    state = record.get("state") or ""
+    city = sanitize_for_log(record.get("city")) or ""
+    state = sanitize_for_log(record.get("state")) or ""
     if city and state:
         return f"{city}, {state}"
     return city or state or "location unknown"
 
 
 def _join(values) -> str:
-    values = values or []
+    values = [sanitize_for_log(v) for v in (values or [])]
     return ", ".join(values) if values else "none"
 
 
 def format_record_lines(record: dict) -> list[str]:
-    status = (record.get("final_icp_status") or "unknown").upper()
-    name = record.get("business_name") or "(unnamed business)"
-    tier = record.get("final_icp_tier") or "-"
+    status = sanitize_for_log(record.get("final_icp_status") or "unknown").upper()
+    name = sanitize_for_log(record.get("business_name")) or "(unnamed business)"
+    tier = sanitize_for_log(record.get("final_icp_tier")) or "-"
     score = record.get("final_icp_score")
-    confidence = record.get("final_icp_confidence") or "-"
+    confidence = sanitize_for_log(record.get("final_icp_confidence")) or "-"
+    website = sanitize_for_log(record.get("website")) or "none"
+    website_status = sanitize_for_log(record.get("website_status")) or "n/a"
+    evidence_source = sanitize_for_log(record.get("evidence_source")) or "n/a"
+    preliminary_status = sanitize_for_log(record.get("preliminary_icp_status")) or "n/a"
+    preliminary_confidence = sanitize_for_log(record.get("preliminary_icp_confidence")) or "n/a"
 
     lines = [
         f"[{status}] {name} | {_location(record)} | Tier {tier} | Score {score} | Confidence {confidence}",
-        f"  Website: {record.get('website') or 'none'} | Website status: {record.get('website_status') or 'n/a'} "
-        f"| Evidence source: {record.get('evidence_source') or 'n/a'}",
-        f"  Preliminary: {record.get('preliminary_icp_status') or 'n/a'} "
-        f"| Score {record.get('preliminary_icp_score')} | Confidence {record.get('preliminary_icp_confidence') or 'n/a'}",
+        f"  Website: {website} | Website status: {website_status} "
+        f"| Evidence source: {evidence_source}",
+        f"  Preliminary: {preliminary_status} "
+        f"| Score {record.get('preliminary_icp_score')} | Confidence {preliminary_confidence}",
         f"  HVAC-direct: {_join(record.get('hvac_direct_signals'))} "
         f"| Vertical: {_join(record.get('commercial_vertical_signals'))} "
         f"| Service: {_join(record.get('commercial_service_signals'))}",
         f"  Residential: {'present (' + _join(record.get('residential_keywords')) + ')' if record.get('residential_present') else 'none'}",
     ]
 
-    reasons = (record.get("exclusion_reasons") or []) + (record.get("qualification_reasons") or [])
+    reasons = [
+        sanitize_for_log(r)
+        for r in (record.get("exclusion_reasons") or []) + (record.get("qualification_reasons") or [])
+    ]
     lines.append(f"  Reason: {'; '.join(reasons) if reasons else 'n/a'}")
 
     newly = record.get("newly_discovered_this_run")
     newly_text = "unknown" if newly is None else ("yes" if newly else "no")
+    master_id = sanitize_for_log(record.get("master_id")) or "n/a"
+    first_seen = sanitize_for_log(record.get("first_seen_at")) or "n/a"
+    last_seen = sanitize_for_log(record.get("last_seen_at")) or "n/a"
     lines.append(
-        f"  Provenance: master_id={record.get('master_id') or 'n/a'} "
-        f"| first_seen={record.get('first_seen_at') or 'n/a'} | last_seen={record.get('last_seen_at') or 'n/a'} "
+        f"  Provenance: master_id={master_id} "
+        f"| first_seen={first_seen} | last_seen={last_seen} "
         f"| source_count={record.get('source_count')} | search_count={record.get('search_count')} "
         f"| newly_discovered_this_run={newly_text}"
     )
