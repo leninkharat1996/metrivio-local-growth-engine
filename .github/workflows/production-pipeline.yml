@@ -56,6 +56,12 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install repository Python dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
       - name: Prepare run metadata
         id: meta
         run: |

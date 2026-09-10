@@ -66,6 +66,35 @@ class ProductionPipelineYamlTests(unittest.TestCase):
                 return idx
         self.fail(f"no step with id {step_id!r} found")
 
+    def _step_name_index(self, name):
+        for idx, step in enumerate(self._steps()):
+            if step.get("name") == name:
+                return idx
+        self.fail(f"no step named {name!r} found")
+
+    def _python_setup_index(self):
+        for idx, step in enumerate(self._steps()):
+            if step.get("uses", "").startswith("actions/setup-python"):
+                return idx
+        self.fail("no actions/setup-python step found")
+
+    # Dependency installation: requirements.txt is installed, after Python
+    # setup and before Stage 3 (the first stage needing a third-party dep).
+    def test_requirements_txt_is_installed(self):
+        install_idx = self._step_name_index("Install repository Python dependencies")
+        install_step = self._steps()[install_idx]
+        run_text = install_step["run"]
+        self.assertIn("pip install -r requirements.txt", run_text)
+        # Must not pin/introduce a different dependency source or version.
+        self.assertNotIn("pip install scrapling", run_text)
+
+    def test_dependency_installation_after_python_setup_and_before_stage3(self):
+        python_idx = self._python_setup_index()
+        install_idx = self._step_name_index("Install repository Python dependencies")
+        stage3_idx = self._step_id_index("stage3")
+        self.assertLess(python_idx, install_idx)
+        self.assertLess(install_idx, stage3_idx)
+
     # 5. correct pipeline stage ordering
     def test_stage_order(self):
         trigger_idx = self._step_id_index("stage1_trigger")
