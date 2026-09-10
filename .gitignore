@@ -38,6 +38,8 @@ icp_stats.json
 enrichment_stats.json
 final_icp_stats.json
 pipeline_summary.json
+final_icp_validation.json
+final_icp_validation.csv
 
 # Python
 __pycache__/
