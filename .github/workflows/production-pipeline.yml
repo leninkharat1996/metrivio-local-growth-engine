@@ -111,7 +111,7 @@ jobs:
           echo "Most recent existing google-maps-scraper.yml run before dispatch: ${before_run_id}"
 
           gh workflow run google-maps-scraper.yml \
-            --ref "${{ github.sha }}" \
+            --ref "${{ github.ref_name }}" \
             -f search_plan="${{ inputs.search_plan }}"
 
           new_run_id=""

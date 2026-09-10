@@ -95,6 +95,12 @@ class ProductionPipelineYamlTests(unittest.TestCase):
         self.assertLess(python_idx, install_idx)
         self.assertLess(install_idx, stage3_idx)
 
+    def test_stage1_dispatch_uses_ref_name_not_sha(self):
+        stage1_trigger = next(s for s in self._steps() if s.get("id") == "stage1_trigger")
+        run_text = stage1_trigger["run"]
+        self.assertIn('--ref "${{ github.ref_name }}"', run_text)
+        self.assertNotIn('--ref "${{ github.sha }}"', run_text)
+
     # 5. correct pipeline stage ordering
     def test_stage_order(self):
         trigger_idx = self._step_id_index("stage1_trigger")
