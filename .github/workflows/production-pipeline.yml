@@ -223,6 +223,19 @@ jobs:
             exit 1
           fi
 
+      - name: "Print record-level Final ICP validation report"
+        id: validation_report
+        if: always() && steps.stage4.outcome == 'success'
+        run: |
+          set -euo pipefail
+          python3 scripts/production_pipeline/validation_report.py \
+            --final-icp-json data/final_icp/final_icp_qualified.json \
+            --master-json data/master/master.json \
+            --out-dir data/final_icp \
+            --json-out final_icp_validation.json \
+            --csv-out final_icp_validation.csv \
+            --run-started-at "${{ steps.meta.outputs.started_at }}"
+
       - name: Build pipeline summary
         id: summary
         if: always()
@@ -265,6 +278,8 @@ jobs:
           path: |
             data/final_icp/final_icp_qualified.json
             data/final_icp/final_icp_qualified.csv
+            data/final_icp/final_icp_validation.json
+            data/final_icp/final_icp_validation.csv
             data/enrichment/website_enrichment.json
             data/enrichment/website_enrichment.csv
             data/icp/icp_qualified.json
@@ -286,7 +301,8 @@ jobs:
             "${{ steps.stage1_master.outcome }}" \
             "${{ steps.stage2.outcome }}" \
             "${{ steps.stage3.outcome }}" \
-            "${{ steps.stage4.outcome }}"; do
+            "${{ steps.stage4.outcome }}" \
+            "${{ steps.validation_report.outcome }}"; do
             if [ "${outcome}" != "success" ]; then
               echo "::error::Production pipeline had a stage with outcome '${outcome}'; failing the run."
               exit 1

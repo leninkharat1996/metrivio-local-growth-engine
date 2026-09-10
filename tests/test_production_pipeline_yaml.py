@@ -146,6 +146,20 @@ class ProductionPipelineYamlTests(unittest.TestCase):
         self.assertIn("--enrichment-json", run_text)
         self.assertIn("config/final_icp_rules.json", run_text)
 
+    def test_validation_report_step_runs_after_stage4_and_invokes_existing_script(self):
+        stage4_idx = self._step_id_index("stage4")
+        validation_idx = self._step_id_index("validation_report")
+        summary_idx = self._step_name_index("Build pipeline summary")
+        self.assertLess(stage4_idx, validation_idx)
+        self.assertLess(validation_idx, summary_idx)
+
+        step = self._steps()[validation_idx]
+        run_text = step["run"]
+        self.assertIn("scripts/production_pipeline/validation_report.py", run_text)
+        self.assertIn("--final-icp-json", run_text)
+        self.assertIn("--master-json", run_text)
+        self.assertEqual(step.get("if"), "always() && steps.stage4.outcome == 'success'")
+
     # 8. artifact upload exists
     def test_artifact_upload_exists(self):
         steps = self._steps()
@@ -157,6 +171,8 @@ class ProductionPipelineYamlTests(unittest.TestCase):
         for expected in (
             "data/final_icp/final_icp_qualified.json",
             "data/final_icp/final_icp_qualified.csv",
+            "data/final_icp/final_icp_validation.json",
+            "data/final_icp/final_icp_validation.csv",
             "data/enrichment/website_enrichment.json",
             "data/enrichment/website_enrichment.csv",
             "data/icp/icp_qualified.json",
