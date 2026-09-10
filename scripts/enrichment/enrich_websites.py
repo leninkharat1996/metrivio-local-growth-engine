@@ -46,14 +46,24 @@ if __package__ in (None, ""):
     from robots import SimpleRobots
     from scrapling_client import ScraplingFetcher
     from url_utils import domain_of, is_valid_url, normalize_url, resolve_link, same_domain
-    from vocabulary import LINK_PRIORITY_KEYWORDS
+    from vocabulary import (
+        LINK_PRIORITY_KEYWORDS,
+        PRE_ENRICHMENT_HVAC_RESCUE_KEYWORDS,
+        PRE_ENRICHMENT_NON_CONTRACTOR_KEYWORDS,
+        PRE_ENRICHMENT_SINGLE_TRADE_KEYWORDS,
+    )
 else:
     from .evidence import dedupe_evidence, extract_evidence, rollup_counts, sort_evidence
     from .html_extract import extract_page
     from .robots import SimpleRobots
     from .scrapling_client import ScraplingFetcher
     from .url_utils import domain_of, is_valid_url, normalize_url, resolve_link, same_domain
-    from .vocabulary import LINK_PRIORITY_KEYWORDS
+    from .vocabulary import (
+        LINK_PRIORITY_KEYWORDS,
+        PRE_ENRICHMENT_HVAC_RESCUE_KEYWORDS,
+        PRE_ENRICHMENT_NON_CONTRACTOR_KEYWORDS,
+        PRE_ENRICHMENT_SINGLE_TRADE_KEYWORDS,
+    )
 
 
 DEFAULT_CONFIG = {
@@ -76,6 +86,45 @@ STATUS_HTTP_ERROR = "http_error"
 STATUS_NON_HTML = "non_html"
 STATUS_CONNECTION_ERROR = "connection_error"
 STATUS_FAILED = "failed"
+STATUS_SKIPPED_NON_HVAC_TRADE = "skipped_non_hvac_trade"
+
+
+def is_obvious_non_hvac_trade(business_name: str | None, category: str | None) -> str | None:
+    """Deterministic, keyword-only pre-enrichment filter (Google Maps
+    name/category text ONLY -- no website evidence exists yet at this
+    point). Returns a short reason string for an OBVIOUS non-HVAC business
+    that should never be crawled, or None to proceed with crawling as
+    normal. Mirrors config/icp_rules.json's hard_exclusions philosophy so
+    excluded/skipped businesses stay consistent across the pipeline.
+
+    Deliberately narrow and biased toward keeping ambiguous cases: a false
+    negative (crawling a non-HVAC business) only wastes some crawl budget,
+    while a false positive (skipping a real HVAC business) would silently
+    drop a prospect -- so every single-trade match is rescued by any HVAC
+    signal in the same text, and only the clearly-never-a-contractor
+    manufacturer/distributor/supply/directory/association keywords skip
+    unconditionally.
+    """
+    text = f"{business_name or ''} {category or ''}".lower()
+    if not text.strip():
+        return None
+
+    non_contractor_hit = next(
+        (kw for kw in PRE_ENRICHMENT_NON_CONTRACTOR_KEYWORDS if kw in text), None
+    )
+    if non_contractor_hit:
+        return f"manufacturer/distributor/supply/directory keyword '{non_contractor_hit}' matched"
+
+    has_hvac_signal = any(kw in text for kw in PRE_ENRICHMENT_HVAC_RESCUE_KEYWORDS)
+    if has_hvac_signal:
+        return None
+
+    for trade_label, keywords in PRE_ENRICHMENT_SINGLE_TRADE_KEYWORDS.items():
+        matched = next((kw for kw in keywords if kw in text), None)
+        if matched:
+            return f"{trade_label} keyword '{matched}' matched with no HVAC signal present"
+
+    return None
 
 OUTPUT_FIELDS = [
     "master_id",
@@ -363,6 +412,16 @@ def enrich_record(record: dict, config: dict, fetcher: Fetcher, robots: SimpleRo
         })
         return base
 
+    skip_reason = is_obvious_non_hvac_trade(business_name, record.get("category"))
+    if skip_reason:
+        base.update({
+            "website_status": STATUS_SKIPPED_NON_HVAC_TRADE,
+            "http_status": None,
+            "crawl_completed_at": started_at,
+            "crawl_errors": [f"pre-enrichment filter: {skip_reason} -- website not crawled"],
+        })
+        return base
+
     if not is_valid_url(website, tuple(config["allowed_schemes"])):
         base.update({
             "website_status": STATUS_INVALID_URL,
@@ -457,10 +516,14 @@ def compute_stats(records: list[dict], results: list[dict]) -> dict:
         "partial": status_counts.get(STATUS_PARTIAL, 0),
         "failed": sum(
             v for k, v in status_counts.items()
-            if k not in (STATUS_SUCCESS, STATUS_PARTIAL, STATUS_NO_WEBSITE, STATUS_INVALID_URL)
+            if k not in (
+                STATUS_SUCCESS, STATUS_PARTIAL, STATUS_NO_WEBSITE, STATUS_INVALID_URL,
+                STATUS_SKIPPED_NON_HVAC_TRADE,
+            )
         ),
         "no_website": status_counts.get(STATUS_NO_WEBSITE, 0),
         "invalid_url": status_counts.get(STATUS_INVALID_URL, 0),
+        "skipped_non_hvac_trade": status_counts.get(STATUS_SKIPPED_NON_HVAC_TRADE, 0),
         "pages_attempted": pages_attempted,
         "pages_successful": pages_successful,
         "pages_failed": pages_failed,

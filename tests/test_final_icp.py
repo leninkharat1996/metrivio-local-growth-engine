@@ -527,6 +527,183 @@ class GitignoreTests(unittest.TestCase):
         self.assertIn("!data/final_icp/.gitkeep", content)
 
 
+class BroadenedEvidenceTests(unittest.TestCase):
+    """Change 1-5 coverage: broadened vocabulary, mixed residential/
+    commercial preservation, plumbing/electrical rescue tightening, and
+    the requirement that generic vertical mentions never qualify alone."""
+
+    def test_1_strong_commercial_hvac_website_qualifies(self):
+        r = classify(evidence=[make_evidence("commercial_hvac"), make_evidence("chiller")])
+        self.assertEqual(r["final_icp_status"], "qualified")
+
+    def test_2_commercial_heating_cooling_language_qualifies_with_hvac_context(self):
+        r = classify(
+            evidence=[
+                make_evidence("commercial_heating", "commercial heating and cooling"),
+                make_evidence("maintenance_contract"),
+            ]
+        )
+        self.assertEqual(r["final_icp_status"], "qualified")
+
+    def test_3_office_warehouse_hvac_service_qualifies(self):
+        evidence = [
+            make_evidence("commercial_hvac"),
+            make_evidence(
+                "commercial_vertical", "office", evidence_type="customer_vertical"
+            ),
+            make_evidence(
+                "commercial_vertical", "warehouse", evidence_type="customer_vertical"
+            ),
+            make_evidence("maintenance_contract"),
+        ]
+        r = classify(evidence=evidence)
+        self.assertEqual(r["final_icp_status"], "qualified")
+
+    def test_4_rooftop_rtu_commercial_service_qualifies(self):
+        r = classify(evidence=[make_evidence("rtu_rooftop"), make_evidence("service_contract")])
+        self.assertEqual(r["final_icp_status"], "qualified")
+
+    def test_5_chiller_boiler_vrf_service_qualifies(self):
+        evidence = [
+            make_evidence("chiller"),
+            make_evidence("boiler"),
+            make_evidence("vrf_vrv"),
+            make_evidence("mechanical_services"),
+        ]
+        r = classify(evidence=evidence)
+        self.assertEqual(r["final_icp_status"], "qualified")
+        self.assertIn("vrf_vrv", r["hvac_direct_signals"])
+
+    def test_6_residential_plus_commercial_hvac_not_excluded(self):
+        evidence = [
+            make_evidence("commercial_hvac"),
+            make_evidence("maintenance_contract"),
+            make_evidence("residential", "residential", evidence_type="residential"),
+        ]
+        r = classify(evidence=evidence)
+        self.assertNotEqual(r["final_icp_status"], "excluded")
+        self.assertTrue(r["residential_signals"]["present"])
+
+    def test_7_residential_only_excluded_per_existing_design(self):
+        evidence = [make_evidence("residential", "residential", evidence_type="residential")]
+        r = classify(
+            evidence=evidence,
+            prelim_overrides={
+                "icp_evidence": ["residential_only_signal"],
+                "icp_exclusions": [
+                    "hard exclusion: residential-only keyword(s) ['residential'] matched with no commercial signal present"
+                ],
+                "icp_confidence": "low",
+                "icp_status": "excluded",
+            },
+        )
+        self.assertEqual(r["final_icp_status"], "excluded")
+
+    def test_8_plumbing_only_excluded(self):
+        r = classify(
+            evidence=[],
+            prelim_overrides={
+                "icp_exclusions": [
+                    "hard exclusion: plumbing_only keyword(s) ['plumbing'] matched with no HVAC signal present"
+                ],
+            },
+        )
+        self.assertEqual(r["final_icp_status"], "excluded")
+
+    def test_9_electrical_only_excluded(self):
+        r = classify(
+            evidence=[],
+            prelim_overrides={
+                "icp_exclusions": [
+                    "hard exclusion: electrical_only keyword(s) ['electrician'] matched with no HVAC signal present"
+                ],
+            },
+        )
+        self.assertEqual(r["final_icp_status"], "excluded")
+
+    def test_10_plumbing_plus_genuine_hvac_eligible(self):
+        r = classify(
+            evidence=[make_evidence("commercial_hvac"), make_evidence("maintenance_contract")],
+            prelim_overrides={
+                "icp_exclusions": [
+                    "hard exclusion: plumbing_only keyword(s) ['plumbing'] matched with no HVAC signal present"
+                ],
+            },
+        )
+        self.assertEqual(r["final_icp_status"], "qualified")
+
+    def test_11_generic_office_warehouse_mention_alone_does_not_qualify(self):
+        evidence = [
+            make_evidence("commercial_vertical", "office", evidence_type="incidental"),
+            make_evidence("commercial_vertical", "warehouse", evidence_type="incidental"),
+        ]
+        r = classify(evidence=evidence)
+        self.assertNotEqual(r["final_icp_status"], "qualified")
+        self.assertEqual(r["commercial_vertical_signals"], [])
+
+    def test_11b_generic_vertical_mention_never_rescues_residential_only(self):
+        evidence = [
+            make_evidence("residential", "residential", evidence_type="residential"),
+            make_evidence("commercial_vertical", "office", evidence_type="incidental"),
+        ]
+        r = classify(
+            evidence=evidence,
+            prelim_overrides={
+                "icp_evidence": ["residential_only_signal"],
+                "icp_exclusions": [
+                    "hard exclusion: residential-only keyword(s) ['residential'] matched with no commercial signal present"
+                ],
+                "icp_confidence": "low",
+                "icp_status": "excluded",
+            },
+        )
+        self.assertEqual(r["final_icp_status"], "excluded")
+
+    def test_12_hvac_manufacturer_distributor_excluded(self):
+        r = classify(
+            evidence=[make_evidence("commercial_hvac", evidence_type="incidental")],
+            enrichment_overrides={
+                "homepage_title": "Metro HVAC Distributor",
+                "homepage_description": "Wholesale HVAC parts and equipment distributor.",
+            },
+        )
+        self.assertEqual(r["final_icp_status"], "excluded")
+
+    def test_13_blocked_website_does_not_automatically_qualify(self):
+        r = classify(evidence=[], website_status="blocked", prelim_overrides={"icp_confidence": "medium"})
+        self.assertNotEqual(r["final_icp_status"], "qualified")
+
+    def test_13b_blocked_website_with_low_prelim_confidence_stays_review(self):
+        r = classify(evidence=[], website_status="blocked", prelim_overrides={"icp_confidence": "low"})
+        self.assertEqual(r["final_icp_status"], "review")
+
+    def test_14_incidental_hvac_mention_on_plumbing_site_does_not_rescue(self):
+        evidence = [make_evidence("commercial_hvac", evidence_type="incidental")]
+        r = classify(
+            evidence=evidence,
+            prelim_overrides={
+                "icp_exclusions": [
+                    "hard exclusion: plumbing_only keyword(s) ['plumbing'] matched with no HVAC signal present"
+                ],
+            },
+        )
+        self.assertEqual(r["final_icp_status"], "excluded")
+
+    def test_new_hvac_categories_are_in_rules(self):
+        for category in ("vrf_vrv", "building_facility_hvac"):
+            self.assertIn(category, RULES["hvac_direct_categories"])
+        self.assertIn("hvac_maintenance_language", RULES["bucket2_service_categories"])
+
+    def test_building_facility_hvac_evidence_qualifies(self):
+        r = classify(
+            evidence=[
+                make_evidence("building_facility_hvac", "building hvac"),
+                make_evidence("hvac_maintenance_language", "hvac maintenance contract"),
+            ]
+        )
+        self.assertEqual(r["final_icp_status"], "qualified")
+
+
 class OutputSchemaTests(unittest.TestCase):
     def test_required_output_fields_present(self):
         r = classify(evidence=[make_evidence("commercial_hvac"), make_evidence("chiller")])

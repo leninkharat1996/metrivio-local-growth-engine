@@ -17,7 +17,9 @@
     "energy_management",
     "chiller",
     "rtu_rooftop",
-    "boiler"
+    "boiler",
+    "vrf_vrv",
+    "building_facility_hvac"
   ],
 
   "bucket2_service_categories": [
@@ -26,7 +28,8 @@
     "service_contract",
     "mechanical_services",
     "design_build",
-    "facility_services"
+    "facility_services",
+    "hvac_maintenance_language"
   ],
 
   "vertical_category": "commercial_vertical",
