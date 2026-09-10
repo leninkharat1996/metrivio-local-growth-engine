@@ -167,16 +167,39 @@ def _direct_service_categories(evidence: list[dict], categories: set) -> set:
     }
 
 
-def _any_commercial_evidence(evidence: list[dict], commercial_categories: set) -> bool:
-    """Any evidence_type at all (direct_service, customer_vertical, or
-    incidental) against a commercial category -- used only to decide
-    whether a residential mention is truly "residential-only" or merely
-    "residential + ambiguous commercial mention"."""
-    return any(e.get("category") in commercial_categories for e in evidence)
+def _any_commercial_evidence(
+    evidence: list[dict], hvac_categories: set, bucket2_categories: set, vertical_category: str
+) -> bool:
+    """True only when there is genuine (not merely incidental/standalone)
+    commercial evidence on the site -- used only to decide whether a
+    residential mention is truly "residential-only" or merely "residential
+    + genuine commercial evidence". A direct-service hit in a HVAC/Bucket-2
+    category counts; a commercial_vertical hit counts only when
+    evidence.py already confirmed it co-occurred with HVAC/service context
+    (evidence_type == "customer_vertical") -- a bare, standalone building-
+    type word ("office", "warehouse", ...) recorded as "incidental" does
+    NOT count here."""
+    for e in evidence:
+        category = e.get("category")
+        evidence_type = e.get("evidence_type")
+        if category in hvac_categories and evidence_type == "direct_service":
+            return True
+        if category in bucket2_categories and evidence_type == "direct_service":
+            return True
+        if category == vertical_category and evidence_type == "customer_vertical":
+            return True
+    return False
 
 
 def _vertical_keywords(evidence: list[dict], vertical_category: str) -> list[str]:
-    return sorted({e["keyword"] for e in evidence if e.get("category") == vertical_category})
+    """Only keywords whose occurrence was confirmed (by evidence.py) to
+    co-occur with HVAC/service context in the same sentence -- a bare,
+    standalone building-type mention never counts as vertical evidence."""
+    return sorted({
+        e["keyword"]
+        for e in evidence
+        if e.get("category") == vertical_category and e.get("evidence_type") == "customer_vertical"
+    })
 
 
 def _residential_keywords(evidence: list[dict], residential_categories: set) -> list[str]:
@@ -274,13 +297,13 @@ def evaluate_residential_only(
     prelim_residential_flag = "residential_only_signal" in prelim_evidence_tags
 
     residential_categories = set(rules["residential_only_categories"])
-    commercial_categories = (
-        set(rules["hvac_direct_categories"])
-        | set(rules["bucket2_service_categories"])
-        | {rules["vertical_category"]}
-    )
+    hvac_categories = set(rules["hvac_direct_categories"])
+    bucket2_categories = set(rules["bucket2_service_categories"])
+    vertical_category = rules["vertical_category"]
     residential_on_site = any(e.get("category") in residential_categories for e in evidence)
-    any_commercial_on_site = _any_commercial_evidence(evidence, commercial_categories)
+    any_commercial_on_site = _any_commercial_evidence(
+        evidence, hvac_categories, bucket2_categories, vertical_category
+    )
 
     if prelim_residential_flag:
         if n_hvac >= 1:

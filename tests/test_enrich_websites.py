@@ -281,6 +281,39 @@ class EvidenceExtractionTests(unittest.TestCase):
         self.assertEqual(len(deduped), 1)
         self.assertEqual(deduped[0]["snippet"], "s1")
 
+    def test_bare_vertical_mention_is_incidental_not_customer_vertical(self):
+        # A standalone building-type word with no HVAC/heating/cooling/
+        # service context in the same sentence must NOT count as real
+        # customer-vertical evidence.
+        items = evidence.extract_evidence(
+            "https://x.example/", "Our office is located downtown near the warehouse district.", 200
+        )
+        vertical_items = [i for i in items if i["category"] == "commercial_vertical"]
+        self.assertTrue(vertical_items)
+        for item in vertical_items:
+            self.assertEqual(item["evidence_type"], "incidental")
+
+    def test_vertical_mention_with_hvac_context_is_customer_vertical(self):
+        items = evidence.extract_evidence(
+            "https://x.example/", "We provide commercial HVAC service for offices and warehouses.", 200
+        )
+        vertical_items = [i for i in items if i["category"] == "commercial_vertical"]
+        self.assertTrue(vertical_items)
+        for item in vertical_items:
+            self.assertEqual(item["evidence_type"], "customer_vertical")
+
+    def test_broadened_commercial_hvac_phrases_detected(self):
+        for phrase in (
+            "we offer hvac for businesses",
+            "our business hvac division",
+            "commercial heating and cooling specialists",
+            "commercial property hvac maintenance",
+            "packaged rooftop units installed",
+            "vrf system design",
+        ):
+            items = evidence.extract_evidence("https://x.example/", f"We provide {phrase}.", 200)
+            self.assertTrue(items, f"expected evidence for phrase: {phrase!r}")
+
     def test_rollup_counts_group_correctly(self):
         items = evidence.extract_evidence(
             "https://x.example/",
@@ -333,6 +366,69 @@ class CrawlAndEnrichmentTests(unittest.TestCase):
         result = ew.enrich_record(record, self.config, fetcher, robots, fixed_now)
         self.assertEqual(result["website_status"], ew.STATUS_NO_WEBSITE)
         self.assertEqual(fetcher.calls, [])
+
+    def test_obvious_plumbing_only_business_skips_crawl(self):
+        record = make_master_record(business_name="Joe's Plumbing Co", category="plumber")
+        fetcher = self._fetcher({})
+        robots = robots_mod.SimpleRobots(lambda u: None, self.config["user_agent"])
+        result = ew.enrich_record(record, self.config, fetcher, robots, fixed_now)
+        self.assertEqual(result["website_status"], ew.STATUS_SKIPPED_NON_HVAC_TRADE)
+        self.assertEqual(fetcher.calls, [])
+
+    def test_obvious_electrical_only_business_skips_crawl(self):
+        record = make_master_record(business_name="Bright Spark Electricians", category="electrician")
+        fetcher = self._fetcher({})
+        robots = robots_mod.SimpleRobots(lambda u: None, self.config["user_agent"])
+        result = ew.enrich_record(record, self.config, fetcher, robots, fixed_now)
+        self.assertEqual(result["website_status"], ew.STATUS_SKIPPED_NON_HVAC_TRADE)
+        self.assertEqual(fetcher.calls, [])
+
+    def test_obvious_handyman_only_business_skips_crawl(self):
+        record = make_master_record(business_name="All-Around Handyman", category="handyman")
+        fetcher = self._fetcher({})
+        robots = robots_mod.SimpleRobots(lambda u: None, self.config["user_agent"])
+        result = ew.enrich_record(record, self.config, fetcher, robots, fixed_now)
+        self.assertEqual(result["website_status"], ew.STATUS_SKIPPED_NON_HVAC_TRADE)
+        self.assertEqual(fetcher.calls, [])
+
+    def test_hvac_manufacturer_skips_crawl_even_with_hvac_in_name(self):
+        record = make_master_record(business_name="Acme HVAC Manufacturing", category="HVAC equipment manufacturer")
+        fetcher = self._fetcher({})
+        robots = robots_mod.SimpleRobots(lambda u: None, self.config["user_agent"])
+        result = ew.enrich_record(record, self.config, fetcher, robots, fixed_now)
+        self.assertEqual(result["website_status"], ew.STATUS_SKIPPED_NON_HVAC_TRADE)
+        self.assertEqual(fetcher.calls, [])
+
+    def test_plumbing_company_with_hvac_in_name_is_not_skipped(self):
+        # "Must not filter a business whose name contains plumbing/electrical
+        # if it also has HVAC in its name/category" -- crawling proceeds
+        # normally (network call happens; fixture 404s are fine here, only
+        # the skip decision itself is under test).
+        record = make_master_record(
+            business_name="Ace Plumbing & HVAC", category="plumbing and HVAC contractor", website=""
+        )
+        fetcher = self._fetcher({})
+        robots = robots_mod.SimpleRobots(lambda u: None, self.config["user_agent"])
+        result = ew.enrich_record(record, self.config, fetcher, robots, fixed_now)
+        # No website on this record, so it hits the no_website path, not the
+        # pre-enrichment skip path -- proving the HVAC rescue prevented an
+        # early skip decision before even reaching the website check.
+        self.assertEqual(result["website_status"], ew.STATUS_NO_WEBSITE)
+
+    def test_pre_filter_function_rescued_by_hvac_signal(self):
+        self.assertIsNone(ew.is_obvious_non_hvac_trade("Ace Plumbing & HVAC", "plumbing and HVAC contractor"))
+
+    def test_pre_filter_function_flags_plumbing_only(self):
+        self.assertIsNotNone(ew.is_obvious_non_hvac_trade("Joe's Plumbing", "plumber"))
+
+    def test_pre_filter_function_flags_hvac_distributor_unconditionally(self):
+        self.assertIsNotNone(ew.is_obvious_non_hvac_trade("Metro HVAC Distributor", "HVAC wholesale distribution"))
+
+    def test_pre_filter_function_keeps_ambiguous_business(self):
+        # A generic/ambiguous business name/category (no trade keyword hit
+        # at all) must never be skipped -- bias toward keeping ambiguous
+        # cases so real HVAC prospects are never silently dropped.
+        self.assertIsNone(ew.is_obvious_non_hvac_trade("Dallas Comfort Systems", "mechanical services"))
 
     def test_invalid_url_makes_no_http_call(self):
         record = make_master_record(website="not-a-url")
@@ -696,11 +792,24 @@ class EvidenceTypeTests(unittest.TestCase):
         self.assertEqual(match["evidence_type"], "incidental")
 
     def test_customer_vertical_labelled(self):
+        # A vertical/building-type word only counts as real customer_vertical
+        # evidence when it co-occurs, in the same sentence, with an
+        # HVAC/heating/cooling/service context word -- see vocabulary.py's
+        # VERTICAL_CONTEXT_MARKERS and evidence.py:classify_evidence_type.
+        items = evidence.extract_evidence(
+            "https://x.example/", "We provide HVAC service for warehouses and office buildings.", 220
+        )
+        match = next(i for i in items if i["category"] == "commercial_vertical")
+        self.assertEqual(match["evidence_type"], "customer_vertical")
+
+    def test_customer_vertical_without_hvac_context_is_incidental(self):
+        # A bare/standalone building-type mention with no HVAC context in
+        # the same sentence must NOT count as real commercial evidence.
         items = evidence.extract_evidence(
             "https://x.example/", "We serve warehouses and office buildings.", 220
         )
         match = next(i for i in items if i["category"] == "commercial_vertical")
-        self.assertEqual(match["evidence_type"], "customer_vertical")
+        self.assertEqual(match["evidence_type"], "incidental")
 
     def test_residential_labelled(self):
         items = evidence.extract_evidence(

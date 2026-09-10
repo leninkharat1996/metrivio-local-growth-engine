@@ -31,6 +31,7 @@ try:
         COMMERCIAL_VERTICAL_CATEGORIES,
         RESIDENTIAL_CATEGORIES,
         ROLLUP_GROUPS,
+        VERTICAL_CONTEXT_MARKERS,
     )
 except ImportError:
     from vocabulary import (
@@ -38,6 +39,7 @@ except ImportError:
         COMMERCIAL_VERTICAL_CATEGORIES,
         RESIDENTIAL_CATEGORIES,
         ROLLUP_GROUPS,
+        VERTICAL_CONTEXT_MARKERS,
     )
 
 EVIDENCE_TYPES = ("direct_service", "customer_vertical", "residential", "incidental")
@@ -109,7 +111,16 @@ def classify_evidence_type(category: str, sentence_lower: str) -> str:
     if category in RESIDENTIAL_CATEGORIES:
         return "residential"
     if category in COMMERCIAL_VERTICAL_CATEGORIES:
-        return "customer_vertical"
+        # Generic building/customer-type words ("office", "warehouse", ...)
+        # only count as real commercial-customer evidence when they
+        # co-occur, in the same sentence, with an HVAC/heating/cooling/
+        # air-conditioning/service context word. A bare, standalone mention
+        # ("we're located in a warehouse district") is recorded as
+        # "incidental" instead -- it must never, by itself, qualify a
+        # business or rescue a residential-only exclusion.
+        if any(marker in sentence_lower for marker in VERTICAL_CONTEXT_MARKERS):
+            return "customer_vertical"
+        return "incidental"
     if any(marker in sentence_lower for marker in INCIDENTAL_MARKERS):
         return "incidental"
     if any(marker in sentence_lower for marker in DIRECT_SERVICE_MARKERS):
