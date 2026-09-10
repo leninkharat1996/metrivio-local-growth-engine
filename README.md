@@ -412,3 +412,64 @@ workflow's queue, or a manual artifact download/upload done by hand).
 Artifacts also have a finite retention window (`retention-days: 90` here,
 and GitHub enforces its own account/plan-level caps) — they are durable
 relative to the cache, not permanent.
+
+## Step 10 -- Final ICP Qualification
+
+The pipeline now runs in three stages: **Google Maps preliminary
+qualification** (name/category text signals only) → **website enrichment**
+(Step 9 -- factual, keyword-matched evidence from a business's own site)
+→ **Final ICP qualification** (`scripts/final_icp/qualify_final.py`),
+which is the last, decision-making layer. It reads `data/icp/
+icp_qualified.json` and `data/enrichment/website_enrichment.json`
+read-only, left-joined by `master_id` (a record with no website/no
+enrichment row is still evaluated, via the fallback path below), and
+never mutates the master store, the preliminary ICP output, or the
+enrichment output.
+
+**Evidence-gated, not score-gated.** `final_icp_status`
+(`qualified`/`review`/`excluded`) is decided entirely by a fixed rule
+hierarchy -- geography, hard exclusions, residential-only, then direct
+commercial-service website evidence -- *before* any score is computed.
+Qualifying on website evidence requires at least one `direct_service`
+match against an **HVAC-specific** category (commercial/industrial HVAC,
+commercial mechanical, chillers, RTUs/rooftop units, boilers, HVAC
+controls, building automation, energy management, commercial
+refrigeration/air-conditioning/heating/cooling) -- generic commercial
+service signals alone (preventive maintenance, maintenance/service
+contracts, mechanical services, design-build, facility services) or
+commercial-vertical mentions can never qualify a record on their own, no
+matter how many of them are present. A business whose website is
+unavailable or unusable can still qualify through a single fallback path
+(high preliminary confidence, no preliminary exclusion, US-confirmed
+geography), but is always capped at `medium` confidence and tier `B`.
+
+`final_icp_score` (0-100, fixed point table) and `final_icp_tier`
+(`A+`/`A`/`B`/`C`/`D`) are computed strictly *after* status is finalized
+and are **prioritization signals only** -- they can never promote a
+record past the status the gate rules already decided. A record with a
+high rating, many reviews, broad commercial-vertical coverage, or several
+generic service-category matches but zero HVAC-specific evidence remains
+`review` (or `excluded`), regardless of score. Tier bands are additionally
+gated (e.g. `A+` requires a fully successful website crawl and at least
+two distinct HVAC-specific categories) so a fallback-qualified or
+partially-crawled record cannot outrank a fully evidence-confirmed one.
+
+**Output:** `data/final_icp/final_icp_qualified.json` and `.csv`, one row
+per preliminary ICP record, sorted by `master_id`. Configuration lives in
+`config/final_icp_rules.json` (category sets, score-bucket point tables,
+tier thresholds -- no field is hardcoded in the script). Same as the
+other generated datasets, `data/final_icp/` is gitignored and fully
+regenerable:
+
+```
+python3 scripts/final_icp/qualify_final.py \
+  --master-json data/master/master.json \
+  --preliminary-json data/icp/icp_qualified.json \
+  --enrichment-json data/enrichment/website_enrichment.json \
+  --out-dir data/final_icp
+```
+
+No AI/LLM calls, no paid APIs, no network requests, no IP geolocation --
+geography uses only the `country`/`state` fields already present on the
+master/preliminary record. Deterministic: the same three input files plus
+a fixed `--evaluated-at` produce byte-identical output.
